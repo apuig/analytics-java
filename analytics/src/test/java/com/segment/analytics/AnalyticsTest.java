@@ -19,6 +19,7 @@ import java.time.temporal.ChronoUnit;
 import java.util.Collections;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.Before;
 import org.junit.Test;
@@ -143,7 +144,7 @@ public class AnalyticsTest {
     } while (initialTime.until(now, ChronoUnit.MILLIS) < millisRunning);
 
     service.shutdown();
-    while (!service.isShutdown() || !service.isTerminated()) {}
+    service.awaitTermination(5, TimeUnit.SECONDS);
 
     verify(spy, times(counter.get())).enqueue(any(Message.class));
   }
