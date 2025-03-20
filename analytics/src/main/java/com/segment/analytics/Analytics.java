@@ -90,11 +90,6 @@ public class Analytics {
     return client.offer(message);
   }
 
-  /** Flush events in the message queue. */
-  public void flush() {
-    client.flush();
-  }
-
   /** Stops this instance from processing further requests. */
   public void shutdown() {
     client.shutdown();

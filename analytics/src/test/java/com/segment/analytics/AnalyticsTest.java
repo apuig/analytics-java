@@ -92,13 +92,6 @@ public class AnalyticsTest {
   }
 
   @Test
-  public void flushIsDispatched() {
-    analytics.flush();
-
-    verify(client).flush();
-  }
-
-  @Test
   public void offerIsDispatched(MessageBuilderTest builder) {
     MessageBuilder messageBuilder = builder.get().userId("dummy");
     Message message = messageBuilder.build();

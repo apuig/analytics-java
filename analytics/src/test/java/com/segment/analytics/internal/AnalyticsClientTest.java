@@ -75,6 +75,7 @@ public class AnalyticsClientTest {
 
   ThreadFactory threadFactory;
   @Spy LinkedBlockingQueue<Message> messageQueue;
+  @Spy LinkedBlockingQueue<Message> pendingQueue;
   @Mock SegmentService segmentService;
   @Mock ExecutorService networkExecutor;
   @Mock Callback callback;
@@ -95,6 +96,7 @@ public class AnalyticsClientTest {
   AnalyticsClient newClient() {
     return new AnalyticsClient(
         messageQueue,
+        pendingQueue,
         null,
         segmentService,
         50,
@@ -129,15 +131,6 @@ public class AnalyticsClientTest {
 
     verify(networkExecutor).shutdown();
     verify(networkExecutor).awaitTermination(1, TimeUnit.SECONDS);
-  }
-
-  @Test
-  public void flushInsertsPoison() throws InterruptedException {
-    AnalyticsClient client = newClient();
-
-    client.flush();
-
-    verify(messageQueue).put(FlushMessage.POISON);
   }
 
   /** Wait until the queue is drained. */
@@ -196,21 +189,6 @@ public class AnalyticsClientTest {
       loopCount++;
     }
     return builder.toString();
-  }
-
-  @Test
-  public void flushSubmitsToExecutor() {
-    messageQueue = new LinkedBlockingQueue<>();
-    AnalyticsClient client = newClient();
-
-    TrackMessage first = TrackMessage.builder("foo").userId("bar").build();
-    TrackMessage second = TrackMessage.builder("qaz").userId("qux").build();
-    client.enqueue(first);
-    client.enqueue(second);
-    client.flush();
-    wait(messageQueue);
-
-    assertThat(captureBatch(networkExecutor).batch()).containsExactly(first, second);
   }
 
   @Test
@@ -284,6 +262,7 @@ public class AnalyticsClientTest {
     AnalyticsClient client =
         new AnalyticsClient(
             messageQueue,
+            pendingQueue,
             null,
             segmentService,
             50,
@@ -542,24 +521,6 @@ public class AnalyticsClientTest {
                     return exception.getMessage().equals("4 retries exhausted");
                   }
                 }));
-  }
-
-  @Test
-  public void flushWhenNotShutDown() throws InterruptedException {
-    AnalyticsClient client = newClient();
-
-    client.flush();
-    verify(messageQueue).put(POISON);
-  }
-
-  @Test
-  public void flushWhenShutDown() throws InterruptedException {
-    AnalyticsClient client = newClient();
-    isShutDown.set(true);
-
-    client.flush();
-
-    verify(messageQueue, times(0)).put(any(Message.class));
   }
 
   @Test
@@ -860,6 +821,7 @@ public class AnalyticsClientTest {
     AnalyticsClient client =
         new AnalyticsClient(
             messageQueue,
+            pendingQueue,
             null,
             segmentService,
             50,
@@ -902,6 +864,7 @@ public class AnalyticsClientTest {
     AnalyticsClient client =
         new AnalyticsClient(
             messageQueue,
+            pendingQueue,
             null,
             segmentService,
             50,
@@ -937,6 +900,7 @@ public class AnalyticsClientTest {
     AnalyticsClient client =
         new AnalyticsClient(
             messageQueue,
+            pendingQueue,
             null,
             segmentService,
             50,
