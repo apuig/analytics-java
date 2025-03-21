@@ -28,7 +28,6 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
 import okhttp3.HttpUrl;
 import retrofit2.Call;
 import retrofit2.Response;
@@ -129,6 +128,7 @@ public class AnalyticsClient {
     this.isShutDown = isShutDown;
     this.writeKey = writeKey;
     this.gsonInstance = gsonInstance;
+        looperThread.start();
   }
 
   public int messageSizeInBytes(Message message) {
@@ -141,7 +141,10 @@ public class AnalyticsClient {
     return messageQueue.offer(message);
   }
 
-    public void enqueue(Message message) {}
+    public void enqueue(Message message) {
+
+        enqueueSend(message);
+    }
 
     public void enqueueSend(Message message) {
     if (isShutDown.get()) {
@@ -289,7 +292,7 @@ public class AnalyticsClient {
     private void notifyCallbacksWithException(Batch batch, Exception exception) {
       for (Message message : batch.batch()) {
         for (Callback callback : client.callbacks) {
-          callback.failure(message, exception);
+          callback.failure(message, exception);          
         }
       }
     }
