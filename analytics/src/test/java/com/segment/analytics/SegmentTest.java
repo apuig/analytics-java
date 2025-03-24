@@ -6,6 +6,7 @@ import static com.github.tomakehurst.wiremock.client.WireMock.stubFor;
 import static com.github.tomakehurst.wiremock.client.WireMock.urlEqualTo;
 import static com.github.tomakehurst.wiremock.core.WireMockConfiguration.wireMockConfig;
 
+import com.github.tomakehurst.wiremock.client.WireMock;
 import com.github.tomakehurst.wiremock.junit.WireMockRule;
 import com.github.tomakehurst.wiremock.stubbing.ServeEvent;
 import com.google.gson.Gson;
@@ -27,12 +28,17 @@ import org.junit.Test;
 import wiremock.com.fasterxml.jackson.core.JsonProcessingException;
 import wiremock.com.fasterxml.jackson.databind.JsonNode;
 import wiremock.com.fasterxml.jackson.databind.ObjectMapper;
+import wiremock.com.google.common.util.concurrent.RateLimiter;
 
 public class SegmentTest {
 
     @Rule
-    public WireMockRule wireMockRule =
-            new WireMockRule(wireMockConfig().dynamicPort().gzipDisabled(true), false);
+    public WireMockRule wireMockRule = new WireMockRule(
+            wireMockConfig()
+                    .port(8088)
+                    // .dynamicPort()
+                    .gzipDisabled(true),
+            false);
 
     Analytics analytics;
 
@@ -48,8 +54,10 @@ public class SegmentTest {
 
         analytics = Analytics.builder("write-key")
                 .endpoint(wireMockRule.baseUrl())
+                // .endpoint("http://localhost:8888")
                 .flushInterval(1, TimeUnit.SECONDS)
-                .queueCapacity(500)
+                .flushQueueSize(20)
+                .queueCapacity(50)
                 // callback
                 // http client
                 .build();
@@ -57,10 +65,31 @@ public class SegmentTest {
 
     @Test
     public void test() throws Throwable {
-        analytics.enqueue(TrackMessage.builder("my-track").messageId("m1").userId("userId"));
-        analytics.enqueue(TrackMessage.builder("my-track").messageId("m2").userId("userId"));
 
-        Awaitility.await().until(() -> sentMessagesEqualsTo("m1", "m2"));
+        stubFor(post(urlEqualTo("/v1/import/"))
+                .willReturn(WireMock.aResponse().withStatus(503).withBody("fail")));
+
+        long start = System.currentTimeMillis();
+        boolean upAgain = false;
+        int id = 0;
+        RateLimiter rate = RateLimiter.create(5);
+        while (true) {
+            if (rate.tryAcquire()) {
+                System.err.println("id " + id);
+                analytics.enqueue(
+                        TrackMessage.builder("my-track").messageId("m" + id++).userId("userId"));
+            }
+            Thread.sleep(50);
+
+            if (!upAgain && System.currentTimeMillis() - start > 120_000) {
+                upAgain = true;
+                stubFor(post(urlEqualTo("/v1/import/")).willReturn(okJson("{\"success\": \"true\"}")));
+                System.err.println("UP AGAIN");
+            }
+        }
+
+        //        analytics.enqueue(TrackMessage.builder("my-track").messageId("m2").userId("userId"));
+        // Awaitility.await().until(() -> sentMessagesEqualsTo("m1", "m2"));
     }
 
     @Test

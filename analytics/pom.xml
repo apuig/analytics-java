@@ -39,10 +39,18 @@
       <artifactId>findbugs</artifactId>
       <scope>provided</scope>
     </dependency>
+    
     <dependency>
-      <groupId>com.segment.backo</groupId>
-      <artifactId>backo</artifactId>
+      <groupId>dev.failsafe</groupId>
+      <artifactId>failsafe</artifactId>
+      <version>3.3.2</version>
     </dependency>
+    <dependency>
+      <groupId>dev.failsafe</groupId>
+      <artifactId>failsafe-retrofit</artifactId>
+      <version>3.3.2</version>
+   </dependency>
+    
     <dependency>
       <groupId>junit</groupId>
       <artifactId>junit</artifactId>

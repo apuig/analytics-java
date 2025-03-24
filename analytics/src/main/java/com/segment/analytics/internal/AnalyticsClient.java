@@ -5,24 +5,30 @@ import static com.segment.analytics.Log.Level.ERROR;
 import static com.segment.analytics.Log.Level.VERBOSE;
 
 import com.google.gson.Gson;
-import com.segment.analytics.Callback;
 import com.segment.analytics.Log;
 import com.segment.analytics.http.SegmentService;
 import com.segment.analytics.http.UploadResponse;
 import com.segment.analytics.messages.Batch;
 import com.segment.analytics.messages.Message;
-import com.segment.backo.Backo;
+import dev.failsafe.CircuitBreaker;
+import dev.failsafe.CircuitBreakerOpenException;
+import dev.failsafe.Failsafe;
+import dev.failsafe.FailsafeExecutor;
+import dev.failsafe.RetryPolicy;
+import dev.failsafe.retrofit.FailsafeCall;
 import java.io.IOException;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.LinkedList;
-import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadFactory;
@@ -38,7 +44,7 @@ public class AnalyticsClient {
   private static final int MSG_MAX_SIZE = 1024 * 32;
   private static final Charset ENCODING = StandardCharsets.UTF_8;
   private Gson gsonInstance;
-  private static final String instanceId = UUID.randomUUID().toString();
+    private static final String instanceId = UUID.randomUUID().toString(); // TODO configurable ?
 
   static {
     Map<String, String> library = new LinkedHashMap<>();
@@ -51,18 +57,16 @@ public class AnalyticsClient {
   }
 
   private final BlockingQueue<Message> messageQueue;
-  private final BlockingQueue<Message> pendingQueue;
   private final HttpUrl uploadUrl;
   private final SegmentService service;
-  private final int size;
+  private final int flushQueueSize;
     private final long flushIntervalInMillis;
-  private final int maximumRetries;
-  private final int maximumQueueByteSize;
   private final Log log;
   private final ExecutorService networkExecutor;
     private final Thread looperThread;
   private final AtomicBoolean isShutDown;
   private final String writeKey;
+    private final FailsafeExecutor<Response<UploadResponse>> failsafe;
 
   public static AnalyticsClient create(
       HttpUrl uploadUrl,
@@ -70,8 +74,6 @@ public class AnalyticsClient {
       int queueCapacity,
       int flushQueueSize,
       long flushIntervalInMillis,
-      int maximumRetries,
-      int maximumQueueSizeInBytes,
       Log log,
       ThreadFactory threadFactory,
       ExecutorService networkExecutor,
@@ -79,13 +81,10 @@ public class AnalyticsClient {
       Gson gsonInstance) {
     return new AnalyticsClient(
         new LinkedBlockingQueue<Message>(queueCapacity),
-        new LinkedBlockingQueue<Message>(queueCapacity),
         uploadUrl,
         segmentService,
         flushQueueSize,
         flushIntervalInMillis,
-        maximumRetries,
-        maximumQueueSizeInBytes,
         log,
         threadFactory,
         networkExecutor,
@@ -96,13 +95,10 @@ public class AnalyticsClient {
 
   public AnalyticsClient(
       BlockingQueue<Message> messageQueue,
-      BlockingQueue<Message> pendingQueue,
       HttpUrl uploadUrl,
       SegmentService service,
-      int maxQueueSize,
+      int flushQueueSize,
       long flushIntervalInMillis,
-      int maximumRetries,
-      int maximumQueueSizeInBytes,
       Log log,
       ThreadFactory threadFactory,
       ExecutorService networkExecutor,
@@ -110,13 +106,10 @@ public class AnalyticsClient {
       String writeKey,
       Gson gsonInstance) {
     this.messageQueue = messageQueue;
-    this.pendingQueue = pendingQueue;
     this.uploadUrl = uploadUrl;
     this.service = service;
-    this.size = maxQueueSize;
+    this.flushQueueSize = flushQueueSize;
         this.flushIntervalInMillis = flushIntervalInMillis;
-    this.maximumRetries = maximumRetries;
-    this.maximumQueueByteSize = maximumQueueSizeInBytes;
     this.log = log;
     this.looperThread = threadFactory.newThread(new Looper());
     this.networkExecutor = networkExecutor;
@@ -124,6 +117,35 @@ public class AnalyticsClient {
     this.writeKey = writeKey;
     this.gsonInstance = gsonInstance;
         looperThread.start();
+
+        CircuitBreaker<Response<UploadResponse>> breaker = CircuitBreaker.<Response<UploadResponse>>builder()
+                // 2 failure in 5 minute open the circuit
+                .withFailureThreshold(2, Duration.ofMinutes(5))
+                // once open wait 1 minute to be half-open
+                .withDelay(Duration.ofMinutes(1))
+                // after 1 success the circuit is closed
+                .withSuccessThreshold(1)
+                // 5xx or rate limit is an error
+                .handleResultIf(response -> is5xx(response.code()) || response.code() == 429)
+                .build();
+
+        RetryPolicy<Response<UploadResponse>> retry = RetryPolicy.<Response<UploadResponse>>builder()
+                .withMaxAttempts(3)
+                .withBackoff(1, 300, ChronoUnit.SECONDS)
+                .withJitter(.1)
+                // retry on IOException
+                .handle(IOException.class)
+                // retry on 5xx or rate limit
+                .handleResultIf(response -> is5xx(response.code()) || response.code() == 429)
+                .onRetriesExceeded(context -> {
+                    throw new RuntimeException("retries");
+                })
+                .onAbort(context -> {
+                    throw new RuntimeException("aborted");
+                })
+                .build();
+
+        this.failsafe = Failsafe.with(retry, breaker).with(networkExecutor);
   }
 
   public int messageSizeInBytes(Message message) {
@@ -137,23 +159,14 @@ public class AnalyticsClient {
   }
 
     public void enqueue(Message message) {
-
-        enqueueSend(message);
+        if (isShutDown.get()) {
+            log.print(ERROR, "Attempt to enqueue a message when shutdown has been called %s.", message);
+            return;
+        }
+        if (!messageQueue.offer(message)) {
+            handleError(message);
+        }
     }
-
-    public void enqueueSend(Message message) {
-    if (isShutDown.get()) {
-      log.print(ERROR, "Attempt to enqueue a message when shutdown has been called %s.", message);
-      return;
-    }
-
-    try {
-      messageQueue.put(message);
-    } catch (InterruptedException e) {
-      log.print(ERROR, e, "Interrupted while adding message %s.", message);
-      Thread.currentThread().interrupt();
-    }
-  }
 
   public void shutdown() {
     if (isShutDown.compareAndSet(false, true)) {
@@ -171,6 +184,8 @@ public class AnalyticsClient {
 
   public void shutdownAndWait(ExecutorService executor, String name) {
     try {
+            this.looperThread.interrupt();
+
       executor.shutdown();
       final boolean executorTerminated = executor.awaitTermination(1, TimeUnit.SECONDS);
 
@@ -228,7 +243,7 @@ public class AnalyticsClient {
           }
 
           Boolean isBlockingSignal = message == null;
-          Boolean isOverflow = messages.size() >= size;
+          Boolean isOverflow = messages.size() >= flushQueueSize;
 
           if (!messages.isEmpty() && (isOverflow || isBlockingSignal || batchSizeLimitReached)) {
             Batch batch = Batch.create(CONTEXT, new ArrayList<>(messages), writeKey);
@@ -237,10 +252,22 @@ public class AnalyticsClient {
                 "Batching %s message(s) into batch %s.",
                 batch.batch().size(),
                 batch.sequence());
-            networkExecutor.submit(
-                BatchUploadTask.create(AnalyticsClient.this, batch, maximumRetries));
 
-            currentBatchSize=0;
+                Call<UploadResponse> call = service.upload(uploadUrl, batch);
+                FailsafeCall<UploadResponse> failsafeCall =
+                        FailsafeCall.with(failsafe).compose(call);
+                failsafeCall.executeAsync()
+                .thenAccept(r -> {
+                    if(is5xx(r.code()) || r.code() == 429) {
+                        handleError(batch, null);
+                    }
+                })
+                .exceptionally(t -> {
+                    handleError(batch, t);
+                    return null;
+                });
+
+            currentBatchSize = 0;
             messages.clear();
             if (batchSizeLimitReached) {
               // If this is true that means the last message that would make us go over the limit
@@ -253,109 +280,30 @@ public class AnalyticsClient {
         }
       } catch (InterruptedException e) {
         log.print(DEBUG, "Looper interrupted while polling for messages.");
-        Thread.currentThread().interrupt(); //XXX
-      }
+                // XXX CANCEL UPLOAD
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
       // SEND pending
       log.print(VERBOSE, "Looper stopped");
     }
+    
   }
-
-  static class BatchUploadTask implements Runnable {
-    private static final Backo BACKO =
-        Backo.builder() //
-            .base(TimeUnit.SECONDS, 15) //
-            .cap(TimeUnit.HOURS, 1) //
-            .jitter(1) //
-            .build();
-
-    private final AnalyticsClient client;
-    private final Backo backo;
-    final Batch batch;
-    private final int maxRetries;
-
-    static BatchUploadTask create(AnalyticsClient client, Batch batch, int maxRetries) {
-      return new BatchUploadTask(client, BACKO, batch, maxRetries);
-    }
-
-    BatchUploadTask(AnalyticsClient client, Backo backo, Batch batch, int maxRetries) {
-      this.client = client;
-      this.batch = batch;
-      this.backo = backo;
-      this.maxRetries = maxRetries;
-    }
-
-    private void notifyCallbacksWithException(Batch batch, Exception exception) {
-        // XXX failure
-    }
-
-    /** Returns {@code true} to indicate a batch should be retried. {@code false} otherwise. */
-    boolean upload() {
-      client.log.print(VERBOSE, "Uploading batch %s.", batch.sequence());
-
-      try {
-        Call<UploadResponse> call = client.service.upload(client.uploadUrl, batch);
-        Response<UploadResponse> response = call.execute();
-
-        if (response.isSuccessful()) {
-          client.log.print(VERBOSE, "Uploaded batch %s.", batch.sequence());
-
-          // XXX success
-          return false;
-        }
-
-        int status = response.code();
-        if (is5xx(status)) {
-          client.log.print(
-              DEBUG, "Could not upload batch %s due to server error. Retrying.", batch.sequence());
-          return true;
-        } else if (status == 429) {
-          client.log.print(
-              DEBUG, "Could not upload batch %s due to rate limiting. Retrying.", batch.sequence());
-          return true;
-        }
-
-        client.log.print(DEBUG, "Could not upload batch %s. Giving up.", batch.sequence());
-        notifyCallbacksWithException(batch, new IOException(response.errorBody().string()));
-
-        return false;
-      } catch (IOException error) {
-        client.log.print(DEBUG, error, "Could not upload batch %s. Retrying.", batch.sequence());
-
-        return true;
-      } catch (Exception exception) {
-        client.log.print(DEBUG, "Could not upload batch %s. Giving up.", batch.sequence());
-
-        notifyCallbacksWithException(batch, exception);
-
-        return false;
+  
+  void handleError(Batch batch, Throwable t) {
+      if(t instanceof CompletionException && t.getCause() instanceof CircuitBreakerOpenException) {
+	  System.err.println("OPEN"); 
       }
-    }
-
-    @Override
-    public void run() {
-      int attempt = 0;
-      for (; attempt <= maxRetries; attempt++) {
-        boolean retry = upload();
-        if (!retry) return;
-        try {
-          backo.sleep(attempt);
-        } catch (InterruptedException e) {
-          client.log.print(
-              DEBUG, "Thread interrupted while backing off for batch %s.", batch.sequence());
-          return;
-        }
-      }
-
-      client.log.print(ERROR, "Could not upload batch %s. Retries exhausted.", batch.sequence());
-      notifyCallbacksWithException(
-          batch, new IOException(Integer.toString(attempt) + " retries exhausted"));
-    }
+	   
+    System.err.println("" + batch);
+  }
+  void handleError(Message message) {
+        System.err.println("" + message);
+  }
 
     private static boolean is5xx(int status) {
       return status >= 500 && status < 600;
-    }
   }
-
   public static class BatchUtility {
 
     /**

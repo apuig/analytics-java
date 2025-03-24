@@ -139,7 +139,6 @@ public class Analytics {
     private ThreadFactory threadFactory;
     private int flushQueueSize;
     private int maximumFlushAttempts;
-    private int maximumQueueSizeInBytes;
     private long flushIntervalInMillis;
     private int queueCapacity;
     private boolean forceTlsV1 = false;
@@ -267,17 +266,6 @@ public class Analytics {
       return this;
     }
 
-    /** Set the queueSize at which flushes should be triggered. */
-    @Beta
-    public Builder maximumQueueSizeInBytes(int bytes) {
-      if (bytes < 1) {
-        throw new IllegalArgumentException("maximumQueueSizeInBytes must not be less than 1.");
-      }
-
-      this.maximumQueueSizeInBytes = bytes;
-      return this;
-    }
-
     /** Set the interval at which the queue should be flushed. */
     @Beta
     public Builder flushInterval(long flushInterval, TimeUnit unit) {
@@ -369,9 +357,6 @@ public class Analytics {
       if (flushQueueSize == 0) {
         flushQueueSize = Platform.get().defaultFlushQueueSize();
       }
-      if (maximumQueueSizeInBytes == 0) {
-        maximumQueueSizeInBytes = MESSAGE_QUEUE_MAX_BYTE_SIZE;
-      }
       if (maximumFlushAttempts == 0) {
         maximumFlushAttempts = 3;
       }
@@ -430,20 +415,17 @@ public class Analytics {
 
       SegmentService segmentService = restAdapter.create(SegmentService.class);
 
-      AnalyticsClient analyticsClient =
-          AnalyticsClient.create(
-              endpoint,
-              segmentService,
-              queueCapacity,
-              flushQueueSize,
-              flushIntervalInMillis,
-              maximumFlushAttempts,
-              maximumQueueSizeInBytes,
-              log,
-              threadFactory,
-              networkExecutor,
-              writeKey,
-              gson);
+    AnalyticsClient analyticsClient = AnalyticsClient.create(
+            endpoint,
+            segmentService,
+            queueCapacity,
+            flushQueueSize,
+            flushIntervalInMillis,
+            log,
+            threadFactory,
+            networkExecutor,
+            writeKey,
+            gson);
 
       return new Analytics(analyticsClient, messageTransformers, messageInterceptors, log);
     }
