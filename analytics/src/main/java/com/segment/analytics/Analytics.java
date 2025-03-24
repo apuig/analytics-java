@@ -141,7 +141,6 @@ public class Analytics {
     private int maximumFlushAttempts;
     private int maximumQueueSizeInBytes;
     private long flushIntervalInMillis;
-    private List<Callback> callbacks;
     private int queueCapacity;
     private boolean forceTlsV1 = false;
     private GsonBuilder gsonBuilder;
@@ -318,21 +317,6 @@ public class Analytics {
       return this;
     }
 
-    /** Add a {@link Callback} to be notified when an event is processed. */
-    public Builder callback(Callback callback) {
-      if (callback == null) {
-        throw new NullPointerException("Null callback");
-      }
-      if (callbacks == null) {
-        callbacks = new ArrayList<>();
-      }
-      if (callbacks.contains(callback)) {
-        throw new IllegalStateException("Callback is already registered.");
-      }
-      callbacks.add(callback);
-      return this;
-    }
-
     /** Use a {@link Plugin} to configure the builder. */
     @Beta
     public Builder plugin(Plugin plugin) {
@@ -407,11 +391,6 @@ public class Analytics {
       if (threadFactory == null) {
         threadFactory = Platform.get().defaultThreadFactory();
       }
-      if (callbacks == null) {
-        callbacks = Collections.emptyList();
-      } else {
-        callbacks = Collections.unmodifiableList(callbacks);
-      }
 
       HttpLoggingInterceptor interceptor =
           new HttpLoggingInterceptor(
@@ -463,7 +442,6 @@ public class Analytics {
               log,
               threadFactory,
               networkExecutor,
-              callbacks,
               writeKey,
               gson);
 

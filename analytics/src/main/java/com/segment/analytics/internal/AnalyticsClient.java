@@ -59,7 +59,6 @@ public class AnalyticsClient {
   private final int maximumRetries;
   private final int maximumQueueByteSize;
   private final Log log;
-  private final List<Callback> callbacks;
   private final ExecutorService networkExecutor;
     private final Thread looperThread;
   private final AtomicBoolean isShutDown;
@@ -76,7 +75,6 @@ public class AnalyticsClient {
       Log log,
       ThreadFactory threadFactory,
       ExecutorService networkExecutor,
-      List<Callback> callbacks,
       String writeKey,
       Gson gsonInstance) {
     return new AnalyticsClient(
@@ -91,7 +89,6 @@ public class AnalyticsClient {
         log,
         threadFactory,
         networkExecutor,
-        callbacks,
         new AtomicBoolean(false),
         writeKey,
         gsonInstance);
@@ -109,7 +106,6 @@ public class AnalyticsClient {
       Log log,
       ThreadFactory threadFactory,
       ExecutorService networkExecutor,
-      List<Callback> callbacks,
       AtomicBoolean isShutDown,
       String writeKey,
       Gson gsonInstance) {
@@ -122,8 +118,7 @@ public class AnalyticsClient {
     this.maximumRetries = maximumRetries;
     this.maximumQueueByteSize = maximumQueueSizeInBytes;
     this.log = log;
-    this.callbacks = callbacks;
-        this.looperThread = threadFactory.newThread(new Looper());
+    this.looperThread = threadFactory.newThread(new Looper());
     this.networkExecutor = networkExecutor;
     this.isShutDown = isShutDown;
     this.writeKey = writeKey;
@@ -290,11 +285,7 @@ public class AnalyticsClient {
     }
 
     private void notifyCallbacksWithException(Batch batch, Exception exception) {
-      for (Message message : batch.batch()) {
-        for (Callback callback : client.callbacks) {
-          callback.failure(message, exception);          
-        }
-      }
+        // XXX failure
     }
 
     /** Returns {@code true} to indicate a batch should be retried. {@code false} otherwise. */
@@ -308,12 +299,7 @@ public class AnalyticsClient {
         if (response.isSuccessful()) {
           client.log.print(VERBOSE, "Uploaded batch %s.", batch.sequence());
 
-          for (Message message : batch.batch()) {
-            for (Callback callback : client.callbacks) {
-              callback.success(message);
-            }
-          }
-
+          // XXX success
           return false;
         }
 

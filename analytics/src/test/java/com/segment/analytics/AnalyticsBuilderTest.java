@@ -382,42 +382,8 @@ public class AnalyticsBuilderTest {
   }
 
   @Test
-  public void nullCallback() {
-    try {
-      builder.callback(null);
-      fail("Should fail for null callback");
-    } catch (NullPointerException e) {
-      assertThat(e).hasMessage("Null callback");
-    }
-  }
-
-  @Test
-  public void duplicateCallback() {
-    Callback callback = mock(Callback.class);
-    try {
-      builder.callback(callback).callback(callback);
-    } catch (IllegalStateException e) {
-      assertThat(e).hasMessage("Callback is already registered.");
-    }
-  }
-
-  @Test
-  public void buildsWithValidCallback() {
-    Analytics analytics = builder.callback(mock(Callback.class)).build();
-    assertThat(analytics).isNotNull();
-  }
-
-  @Test
   public void buildsWithForceTlsV1() {
     Analytics analytics = builder.forceTlsVersion1().build();
-    assertThat(analytics).isNotNull();
-  }
-
-  @Test
-  public void multipleCallbacks() {
-    Analytics analytics =
-        builder.callback(mock(Callback.class)).callback(mock(Callback.class)).build();
-
     assertThat(analytics).isNotNull();
   }
 
