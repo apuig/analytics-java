@@ -69,6 +69,7 @@ public class FallbackAppender {
     // block !!!
     public void add(Message msg) {
         try {
+            System.err.println("failed " + msg.messageId());
             queue.put(msg);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -105,17 +106,15 @@ public class FallbackAppender {
 
                     // FIXME batch
                     while (!msgs.isEmpty()) {
-                        int reenqueued = 0;
                         boolean canEnqueue = true;
                         for (int i = msgs.size() - 1; canEnqueue && i >= 0; i--) {
                             Message msg = msgs.get(i);
                             canEnqueue = client.offer(msg);
                             if (canEnqueue) {
                                 msgs.remove(i);
-                                reenqueued++;
+                                System.err.println("reenqueued " + msg.messageId());
                             }
                         }
-                        System.err.println("reenqueued " + reenqueued);
                         try {
                             Thread.sleep(1_000);
                         } catch (InterruptedException e) {

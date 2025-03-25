@@ -119,14 +119,17 @@ public class AnalyticsClient {
         looperThread.start();
 
         CircuitBreaker<Response<UploadResponse>> breaker = CircuitBreaker.<Response<UploadResponse>>builder()
-                // 5 failure in 2 minute open the circuit
-                .withFailureThreshold(5, Duration.ofMinutes(2))
+                // 10 failure in 2 minute open the circuit
+                .withFailureThreshold(10, Duration.ofMinutes(2))
                 // once open wait 30 seconds to be half-open
                 .withDelay(Duration.ofSeconds(30))
                 // after 1 success the circuit is closed
                 .withSuccessThreshold(1)
                 // 5xx or rate limit is an error
                 .handleResultIf(response -> is5xx(response.code()) || response.code() == 429)
+                .onOpen(el -> System.err.println("***\nOPEN\n***"))
+                .onHalfOpen(el -> System.err.println("***\nHALF OPEN\n***"))
+                .onClose(el -> System.err.println("***\nCLOSED\n***"))
                 .build();
 
         RetryPolicy<Response<UploadResponse>> retry = RetryPolicy.<Response<UploadResponse>>builder()
@@ -137,12 +140,6 @@ public class AnalyticsClient {
                 .handle(IOException.class)
                 // retry on 5xx or rate limit
                 .handleResultIf(response -> is5xx(response.code()) || response.code() == 429)
-                .onRetriesExceeded(context -> {
-                    throw new RuntimeException("retries");
-                })
-                .onAbort(context -> {
-                    throw new RuntimeException("aborted");
-                })
                 .build();
 
         this.failsafe = Failsafe.with(retry, breaker).with(networkExecutor);
@@ -166,6 +163,9 @@ public class AnalyticsClient {
         }
         if (!messageQueue.offer(message)) {
             handleError(message);
+        }
+        else {
+            System.err.println("enqueued " + message.messageId());
         }
     }
     

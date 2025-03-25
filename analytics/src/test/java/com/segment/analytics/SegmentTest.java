@@ -16,7 +16,10 @@ import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.awaitility.Awaitility;
 import org.junit.After;
 import org.junit.Before;
@@ -64,23 +67,30 @@ public class SegmentTest {
                 .willReturn(
                         WireMock.aResponse().withStatus(503).withBody("fail").withUniformRandomDelay(100, 1_000)));
 
+        int requestsPerSecond = 10;
+        int numClients = 10;
+        int timeToRun = 90_000;
+        int timeToRestore = 30_000;
+
         long start = System.currentTimeMillis();
         boolean upAgain = false;
-        int id = 0;
+        final AtomicInteger id = new AtomicInteger(0);
         List<String> ids = new ArrayList<>();
-        RateLimiter rate = RateLimiter.create(5);
-        while (System.currentTimeMillis() - start < 60_000) {
-            if (rate.tryAcquire()) {
-                String msgid = "m" + id++;
-                ids.add(msgid);
-                analytics.enqueue(
-                        TrackMessage.builder("my-track").messageId(msgid).userId("userId"));
-                System.err.println("enqued " + msgid);
-            }
-            
-            Thread.sleep(50);
 
-            if (!upAgain && System.currentTimeMillis() - start > 20_000) {
+        RateLimiter rate = RateLimiter.create(requestsPerSecond);
+        ExecutorService exec = Executors.newWorkStealingPool(numClients);
+
+        while (System.currentTimeMillis() - start < timeToRun) {
+            if (rate.tryAcquire()) {
+                exec.submit(() -> {
+                    String msgid = "m" + id.getAndIncrement();
+                    ids.add(msgid);
+                    analytics.enqueue(
+                            TrackMessage.builder("my-track").messageId(msgid).userId("userId"));
+                });
+            }
+            Thread.sleep(1);
+            if (!upAgain && System.currentTimeMillis() - start > timeToRestore) {
                 upAgain = true;
                 stubFor(post(urlEqualTo("/v1/import/"))
                         .willReturn(okJson("{\"success\": \"true\"}").withUniformRandomDelay(100, 1_000)));
@@ -92,6 +102,9 @@ public class SegmentTest {
                 .atMost(10, TimeUnit.MINUTES)
                 .pollInterval(1, TimeUnit.SECONDS)
                 .until(() -> sentMessagesEqualsTo(ids.toArray(new String[ids.size()])));
+
+        exec.shutdownNow();
+        exec.awaitTermination(10, TimeUnit.SECONDS);
     }
 
     private static final ObjectMapper OM = new ObjectMapper();
