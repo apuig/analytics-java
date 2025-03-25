@@ -41,7 +41,6 @@ import retrofit2.Response;
 public class AnalyticsClient {
   private static final Map<String, ?> CONTEXT;
   private static final int BATCH_MAX_SIZE = 1024 * 500;
-  private static final int MSG_MAX_SIZE = 1024 * 32;
   private static final Charset ENCODING = StandardCharsets.UTF_8;
   private Gson gsonInstance;
     private static final String instanceId = UUID.randomUUID().toString(); // TODO configurable ?
@@ -67,6 +66,7 @@ public class AnalyticsClient {
   private final AtomicBoolean isShutDown;
   private final String writeKey;
     private final FailsafeExecutor<Response<UploadResponse>> failsafe;
+    private final FallbackAppender fallback;
 
   public static AnalyticsClient create(
       HttpUrl uploadUrl,
@@ -119,10 +119,10 @@ public class AnalyticsClient {
         looperThread.start();
 
         CircuitBreaker<Response<UploadResponse>> breaker = CircuitBreaker.<Response<UploadResponse>>builder()
-                // 2 failure in 5 minute open the circuit
-                .withFailureThreshold(2, Duration.ofMinutes(5))
-                // once open wait 1 minute to be half-open
-                .withDelay(Duration.ofMinutes(1))
+                // 5 failure in 2 minute open the circuit
+                .withFailureThreshold(5, Duration.ofMinutes(2))
+                // once open wait 30 seconds to be half-open
+                .withDelay(Duration.ofSeconds(30))
                 // after 1 success the circuit is closed
                 .withSuccessThreshold(1)
                 // 5xx or rate limit is an error
@@ -130,9 +130,9 @@ public class AnalyticsClient {
                 .build();
 
         RetryPolicy<Response<UploadResponse>> retry = RetryPolicy.<Response<UploadResponse>>builder()
-                .withMaxAttempts(3)
+                .withMaxAttempts(5)
                 .withBackoff(1, 300, ChronoUnit.SECONDS)
-                .withJitter(.1)
+                .withJitter(.2)
                 // retry on IOException
                 .handle(IOException.class)
                 // retry on 5xx or rate limit
@@ -146,6 +146,7 @@ public class AnalyticsClient {
                 .build();
 
         this.failsafe = Failsafe.with(retry, breaker).with(networkExecutor);
+        this.fallback = new FallbackAppender(this);
   }
 
   public int messageSizeInBytes(Message message) {
@@ -167,13 +168,16 @@ public class AnalyticsClient {
             handleError(message);
         }
     }
+    
 
+    // FIXME closeable
   public void shutdown() {
     if (isShutDown.compareAndSet(false, true)) {
       final long start = System.currentTimeMillis();
 
       // first let's tell the system to stop
       looperThread.interrupt();
+      fallback.close();
 
       shutdownAndWait(networkExecutor, "network");
 
@@ -182,10 +186,8 @@ public class AnalyticsClient {
     }
   }
 
-  public void shutdownAndWait(ExecutorService executor, String name) {
+    private void shutdownAndWait(ExecutorService executor, String name) {
     try {
-            this.looperThread.interrupt();
-
       executor.shutdown();
       final boolean executorTerminated = executor.awaitTermination(1, TimeUnit.SECONDS);
 
@@ -291,14 +293,18 @@ public class AnalyticsClient {
   }
   
   void handleError(Batch batch, Throwable t) {
-      if(t instanceof CompletionException && t.getCause() instanceof CircuitBreakerOpenException) {
-	  System.err.println("OPEN"); 
+      if(t instanceof CompletionException ) {
+	  if(t.getCause() instanceof CircuitBreakerOpenException) {	      
+	      System.err.println("OPEN"); 
+	  }
       }
-	   
-    System.err.println("" + batch);
+      for(Message msg : batch.batch()) {	  
+	  fallback.add(msg);
+      }
   }
-  void handleError(Message message) {
-        System.err.println("" + message);
+
+    void handleError(Message msg) {
+        fallback.add(msg);
   }
 
     private static boolean is5xx(int status) {

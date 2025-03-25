@@ -9,19 +9,16 @@ import static com.github.tomakehurst.wiremock.core.WireMockConfiguration.wireMoc
 import com.github.tomakehurst.wiremock.client.WireMock;
 import com.github.tomakehurst.wiremock.junit.WireMockRule;
 import com.github.tomakehurst.wiremock.stubbing.ServeEvent;
-import com.google.gson.Gson;
-import com.google.gson.GsonBuilder;
-import com.segment.analytics.gson.AutoValueAdapterFactory;
-import com.segment.analytics.gson.ISO8601DateAdapter;
 import com.segment.analytics.messages.TrackMessage;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Date;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import org.awaitility.Awaitility;
+import org.junit.After;
 import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
@@ -42,68 +39,59 @@ public class SegmentTest {
 
     Analytics analytics;
 
-    GsonBuilder gsonBuilder = new GsonBuilder()
-            .registerTypeAdapterFactory(new AutoValueAdapterFactory())
-            .registerTypeAdapter(Date.class, new ISO8601DateAdapter());
-
-    Gson gson = gsonBuilder.create();
-
     @Before
-    public void confWireMock() {
+    public void confWireMockAndClient() {
         stubFor(post(urlEqualTo("/v1/import/")).willReturn(okJson("{\"success\": \"true\"}")));
 
         analytics = Analytics.builder("write-key")
                 .endpoint(wireMockRule.baseUrl())
-                // .endpoint("http://localhost:8888")
                 .flushInterval(1, TimeUnit.SECONDS)
                 .flushQueueSize(20)
                 .queueCapacity(50)
-                // callback
                 // http client
                 .build();
+    }
+
+    @After
+    public void tearDown() {
+        analytics.shutdown();
     }
 
     @Test
     public void test() throws Throwable {
 
         stubFor(post(urlEqualTo("/v1/import/"))
-                .willReturn(WireMock.aResponse().withStatus(503).withBody("fail")));
+                .willReturn(
+                        WireMock.aResponse().withStatus(503).withBody("fail").withUniformRandomDelay(100, 1_000)));
 
         long start = System.currentTimeMillis();
         boolean upAgain = false;
         int id = 0;
+        List<String> ids = new ArrayList<>();
         RateLimiter rate = RateLimiter.create(5);
-        while (true) {
+        while (System.currentTimeMillis() - start < 60_000) {
             if (rate.tryAcquire()) {
-                System.err.println("id " + id);
+                String msgid = "m" + id++;
+                ids.add(msgid);
                 analytics.enqueue(
-                        TrackMessage.builder("my-track").messageId("m" + id++).userId("userId"));
+                        TrackMessage.builder("my-track").messageId(msgid).userId("userId"));
+                System.err.println("enqued " + msgid);
             }
+            
             Thread.sleep(50);
 
-            if (!upAgain && System.currentTimeMillis() - start > 120_000) {
+            if (!upAgain && System.currentTimeMillis() - start > 20_000) {
                 upAgain = true;
-                stubFor(post(urlEqualTo("/v1/import/")).willReturn(okJson("{\"success\": \"true\"}")));
+                stubFor(post(urlEqualTo("/v1/import/"))
+                        .willReturn(okJson("{\"success\": \"true\"}").withUniformRandomDelay(100, 1_000)));
                 System.err.println("UP AGAIN");
             }
         }
 
-        //        analytics.enqueue(TrackMessage.builder("my-track").messageId("m2").userId("userId"));
-        // Awaitility.await().until(() -> sentMessagesEqualsTo("m1", "m2"));
-    }
-
-    @Test
-    public void testMore() throws Throwable {
-        System.err.println("wm at " + wireMockRule.baseUrl());
-        int num = 100_000;
-        String[] expectedIds = new String[num];
-        for (int i = 0; i < num; i++) {
-            String id = "m" + i;
-            expectedIds[i] = id;
-            analytics.enqueue(TrackMessage.builder("my-track").messageId(id).userId("userId"));
-        }
-
-        Awaitility.await().atMost(1, TimeUnit.MINUTES).until(() -> sentMessagesEqualsTo(expectedIds));
+        Awaitility.await()
+                .atMost(10, TimeUnit.MINUTES)
+                .pollInterval(1, TimeUnit.SECONDS)
+                .until(() -> sentMessagesEqualsTo(ids.toArray(new String[ids.size()])));
     }
 
     private static final ObjectMapper OM = new ObjectMapper();
@@ -112,9 +100,13 @@ public class SegmentTest {
         return new HashSet<>(sentMessages()).equals(new HashSet<>(Arrays.asList(msgIds)));
     }
 
-    private List<String> sentMessages() {
-        List<String> messageIds = new ArrayList<>();
+    private Set<String> sentMessages() {
+        Set<String> messageIds = new HashSet<>();
         for (ServeEvent event : wireMockRule.getAllServeEvents()) {
+            if (event.getResponse().getStatus() != 200) {
+                continue;
+            }
+
             JsonNode batch;
             try {
                 JsonNode json = OM.readTree(event.getRequest().getBodyAsString());
@@ -130,6 +122,7 @@ public class SegmentTest {
                 messageIds.add(msgs.next().get("messageId").asText());
             }
         }
+        System.err.println("Confirmed msgs : " + messageIds.size());
         return messageIds;
     }
 }
