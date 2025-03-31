@@ -21,11 +21,11 @@ import java.io.File;
 import java.io.IOException;
 import java.io.UnsupportedEncodingException;
 import java.nio.ByteBuffer;
-import java.nio.channels.SeekableByteChannel;
+import java.nio.channels.FileChannel;
+import java.nio.channels.FileLock;
 import java.nio.charset.Charset;
 import java.nio.charset.CharsetEncoder;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
@@ -278,7 +278,8 @@ public class ReversedLinesFileReader implements Closeable {
 
     private final int blockSize;
     private final Charset charset;
-    private final SeekableByteChannel channel;
+    private final FileChannel channel;
+    private final FileLock fileLock;
     private final long totalByteLength;
     private final long totalBlockCount;
     private final byte[][] newLineSequences;
@@ -422,7 +423,8 @@ public class ReversedLinesFileReader implements Closeable {
         this.avoidNewlineSplitBufferSize = newLineSequences[0].length;
 
         // Open file
-        this.channel = Files.newByteChannel(file, StandardOpenOption.READ);
+        this.channel = FileChannel.open(file, StandardOpenOption.READ, StandardOpenOption.WRITE);
+        this.fileLock = channel.lock();
         this.totalByteLength = channel.size();
         int lastBlockLength = (int) (this.totalByteLength % blockSize);
         if (lastBlockLength > 0) {
@@ -461,6 +463,7 @@ public class ReversedLinesFileReader implements Closeable {
      */
     @Override
     public void close() throws IOException {
+        fileLock.release();
         channel.close();
     }
 
@@ -514,10 +517,18 @@ public class ReversedLinesFileReader implements Closeable {
         for (int i = 0; i < lineCount; i++) {
             final String line = readLine();
             if (line == null) {
+                channel.truncate(0);
                 return arrayList;
             }
             arrayList.add(line);
         }
+
+        long truncateTo = (this.currentFilePart.no - 1) * blockSize;
+        truncateTo += this.currentFilePart.currentLastBytePos + 1;
+        channel.truncate(truncateTo);
+
+        channel.force(true);
+
         return arrayList;
     }
 
