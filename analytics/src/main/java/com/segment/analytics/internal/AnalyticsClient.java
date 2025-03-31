@@ -138,8 +138,10 @@ public class AnalyticsClient {
                 .withJitter(.2)
                 // retry on IOException
                 .handle(IOException.class)
-                // retry on 5xx or rate limit
-                .handleResultIf(response -> is5xx(response.code()) || response.code() == 429)
+                // retry on 5xx
+                .handleResultIf(response -> is5xx(response.code()))
+                // stop retry on rate limit
+                .abortIf(response -> response.code() == 429)
                 .build();
 
         this.failsafe = Failsafe.with(retry, breaker).with(networkExecutor);
