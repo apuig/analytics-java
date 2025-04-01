@@ -7,8 +7,13 @@ import com.segment.analytics.gson.ISO8601DateAdapter;
 import com.segment.analytics.http.SegmentService;
 import com.segment.analytics.internal.AnalyticsClient;
 import com.segment.analytics.internal.AnalyticsVersion;
+import com.segment.analytics.internal.Config;
+import com.segment.analytics.internal.Config.FileConfig;
+import com.segment.analytics.internal.Config.HttpConfig;
 import com.segment.analytics.messages.Message;
 import com.segment.analytics.messages.MessageBuilder;
+import java.io.Closeable;
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -16,7 +21,6 @@ import java.util.Date;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ThreadFactory;
-import java.util.concurrent.TimeUnit;
 import okhttp3.ConnectionSpec;
 import okhttp3.HttpUrl;
 import okhttp3.OkHttpClient;
@@ -40,7 +44,7 @@ import retrofit2.converter.gson.GsonConverterFactory;
  *
  * @see <a href="https://Segment/">Segment</a>
  */
-public class Analytics {
+public class Analytics implements Closeable {
   private final AnalyticsClient client;
   private final List<MessageTransformer> messageTransformers;
   private final List<MessageInterceptor> messageInterceptors;
@@ -90,9 +94,9 @@ public class Analytics {
     return client.offer(message);
   }
 
-  /** Stops this instance from processing further requests. */
-  public void shutdown() {
-    client.shutdown();
+    /** Stops this instance from processing further requests. */
+    public void close() {
+        client.close();
   }
 
   /**
@@ -125,7 +129,6 @@ public class Analytics {
     private static final String DEFAULT_ENDPOINT = "https://api.segment.io";
     private static final String DEFAULT_PATH = "/v1/import/";
     private static final String DEFAULT_USER_AGENT = "analytics-java/" + AnalyticsVersion.get();
-    private static final int MESSAGE_QUEUE_MAX_BYTE_SIZE = 1024 * 500;
 
     private final String writeKey;
     private OkHttpClient client;
@@ -137,12 +140,10 @@ public class Analytics {
     private List<MessageInterceptor> messageInterceptors;
     private ExecutorService networkExecutor;
     private ThreadFactory threadFactory;
-    private int flushQueueSize;
-    private int maximumFlushAttempts;
-    private long flushIntervalInMillis;
-    private int queueCapacity;
     private boolean forceTlsV1 = false;
     private GsonBuilder gsonBuilder;
+    private HttpConfig httpConfig;
+    private FileConfig fileConfig;
 
     Builder(String writeKey) {
       if (writeKey == null || writeKey.trim().length() == 0) {
@@ -234,15 +235,6 @@ public class Analytics {
       return this;
     }
 
-    /** Set queue capacity */
-    public Builder queueCapacity(int capacity) {
-      if (capacity <= 0) {
-        throw new IllegalArgumentException("capacity should be positive.");
-      }
-      this.queueCapacity = capacity;
-      return this;
-    }
-
     public Builder gsonBuilder(GsonBuilder gsonBuilder) {
       if (gsonBuilder == null) {
         throw new NullPointerException("Null gsonBuilder");
@@ -253,36 +245,6 @@ public class Analytics {
       }
 
       this.gsonBuilder = gsonBuilder;
-      return this;
-    }
-
-    /** Set the queueSize at which flushes should be triggered. */
-    @Beta
-    public Builder flushQueueSize(int flushQueueSize) {
-      if (flushQueueSize < 1) {
-        throw new IllegalArgumentException("flushQueueSize must not be less than 1.");
-      }
-      this.flushQueueSize = flushQueueSize;
-      return this;
-    }
-
-    /** Set the interval at which the queue should be flushed. */
-    @Beta
-    public Builder flushInterval(long flushInterval, TimeUnit unit) {
-      long flushIntervalInMillis = unit.toMillis(flushInterval);
-      if (flushIntervalInMillis < 1000) {
-        throw new IllegalArgumentException("flushInterval must not be less than 1 second.");
-      }
-      this.flushIntervalInMillis = flushIntervalInMillis;
-      return this;
-    }
-
-    /** Set how many retries should happen before getting exhausted */
-    public Builder retries(int maximumRetries) {
-      if (maximumRetries < 1) {
-        throw new IllegalArgumentException("retries must be at least 1");
-      }
-      this.maximumFlushAttempts = maximumRetries;
       return this;
     }
 
@@ -320,9 +282,22 @@ public class Analytics {
       forceTlsV1 = true;
       return this;
     }
+    
+    public Builder httpConfig(HttpConfig httpConfig) {
+	this.httpConfig = httpConfig;
+	return this;
+    }
+    public Builder fileConfig(FileConfig fileConfig) {
+	this.fileConfig = fileConfig;
+	return this;
+    }
 
-    /** Create a {@link Analytics} client. */
-    public Analytics build() {
+    /**
+     * Create a {@link Analytics} client.
+     * 
+     * @throws IOException if cannot create the configured filePath directory
+     */
+    public Analytics build() throws IOException {
       if (gsonBuilder == null) {
         gsonBuilder = new GsonBuilder();
       }
@@ -341,24 +316,8 @@ public class Analytics {
         }
       }
 
-      if (client == null) {
-        client = Platform.get().defaultClient();
-      }
-
       if (log == null) {
         log = Log.NONE;
-      }
-      if (flushIntervalInMillis == 0) {
-        flushIntervalInMillis = Platform.get().defaultFlushIntervalInMillis();
-      }
-      if (queueCapacity == 0) {
-        queueCapacity = Integer.MAX_VALUE;
-      }
-      if (flushQueueSize == 0) {
-        flushQueueSize = Platform.get().defaultFlushQueueSize();
-      }
-      if (maximumFlushAttempts == 0) {
-        maximumFlushAttempts = 3;
       }
       if (messageTransformers == null) {
         messageTransformers = Collections.emptyList();
@@ -371,10 +330,19 @@ public class Analytics {
         messageInterceptors = Collections.unmodifiableList(messageInterceptors);
       }
       if (networkExecutor == null) {
-        networkExecutor = Platform.get().defaultNetworkExecutor();
+        networkExecutor = Config.defaultNetworkExecutor();
       }
       if (threadFactory == null) {
-        threadFactory = Platform.get().defaultThreadFactory();
+        threadFactory = Config.defaultThreadFactory();
+      }
+      if (client == null) {
+	client = Config.defaultClient();
+      }
+      if(httpConfig == null) {
+	  httpConfig = HttpConfig.builder().build();
+      }
+      if(fileConfig == null) {
+	  fileConfig = FileConfig.builder().build();
       }
 
       HttpLoggingInterceptor interceptor =
@@ -415,18 +383,7 @@ public class Analytics {
 
       SegmentService segmentService = restAdapter.create(SegmentService.class);
 
-    AnalyticsClient analyticsClient = AnalyticsClient.create(
-            endpoint,
-            segmentService,
-            queueCapacity,
-            flushQueueSize,
-            flushIntervalInMillis,
-            log,
-            threadFactory,
-            networkExecutor,
-            writeKey,
-            gson);
-
+      AnalyticsClient analyticsClient = new AnalyticsClient(endpoint, segmentService, log, threadFactory, networkExecutor, writeKey, gson, httpConfig, fileConfig);
       return new Analytics(analyticsClient, messageTransformers, messageInterceptors, log);
     }
   }

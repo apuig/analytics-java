@@ -8,19 +8,18 @@ import com.google.gson.Gson;
 import com.segment.analytics.Log;
 import com.segment.analytics.http.SegmentService;
 import com.segment.analytics.http.UploadResponse;
+import com.segment.analytics.internal.Config.FileConfig;
+import com.segment.analytics.internal.Config.HttpConfig;
 import com.segment.analytics.messages.Batch;
 import com.segment.analytics.messages.Message;
 import dev.failsafe.CircuitBreaker;
-import dev.failsafe.CircuitBreakerOpenException;
-import dev.failsafe.Failsafe;
-import dev.failsafe.FailsafeExecutor;
-import dev.failsafe.RetryPolicy;
-import dev.failsafe.retrofit.FailsafeCall;
+import java.io.Closeable;
 import java.io.IOException;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.Duration;
-import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashMap;
@@ -28,22 +27,28 @@ import java.util.LinkedList;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 import okhttp3.HttpUrl;
-import retrofit2.Call;
+import okhttp3.MediaType;
+import okhttp3.RequestBody;
 import retrofit2.Response;
 
-public class AnalyticsClient {
+public class AnalyticsClient implements Closeable {
+  private static final Logger LOGGER = Logger.getLogger(AnalyticsClient.class.getName());
+
   private static final Map<String, ?> CONTEXT;
   private static final int BATCH_MAX_SIZE = 1024 * 500;
+  private static final int MSG_MAX_SIZE = 1024 * 32;
   private static final Charset ENCODING = StandardCharsets.UTF_8;
   private Gson gsonInstance;
-    private static final String instanceId = UUID.randomUUID().toString(); // TODO configurable ?
+  private static final String instanceId = UUID.randomUUID().toString(); // TODO configurable ?
 
   static {
     Map<String, String> library = new LinkedHashMap<>();
@@ -55,149 +60,99 @@ public class AnalyticsClient {
     CONTEXT = Collections.unmodifiableMap(context);
   }
 
+  private final HttpConfig config;
   private final BlockingQueue<Message> messageQueue;
   private final HttpUrl uploadUrl;
   private final SegmentService service;
-  private final int flushQueueSize;
-    private final long flushIntervalInMillis;
   private final Log log;
   private final ExecutorService networkExecutor;
-    private final Thread looperThread;
-  private final AtomicBoolean isShutDown;
   private final String writeKey;
-    private final FailsafeExecutor<Response<UploadResponse>> failsafe;
-    private final FallbackAppender fallback;
+  private final Thread looperThread;
+  private final AtomicBoolean isShutDown = new AtomicBoolean(false);
+  private final CircuitBreaker<?> breaker;
+  private final FallbackAppender fallback;
+  private final ResubmitCheck resubmit;
 
-  public static AnalyticsClient create(
-      HttpUrl uploadUrl,
-      SegmentService segmentService,
-      int queueCapacity,
-      int flushQueueSize,
-      long flushIntervalInMillis,
-      Log log,
-      ThreadFactory threadFactory,
-      ExecutorService networkExecutor,
-      String writeKey,
-      Gson gsonInstance) {
-    return new AnalyticsClient(
-        new LinkedBlockingQueue<Message>(queueCapacity),
-        uploadUrl,
-        segmentService,
-        flushQueueSize,
-        flushIntervalInMillis,
-        log,
-        threadFactory,
-        networkExecutor,
-        new AtomicBoolean(false),
-        writeKey,
-        gsonInstance);
-  }
-
-  public AnalyticsClient(
-      BlockingQueue<Message> messageQueue,
-      HttpUrl uploadUrl,
-      SegmentService service,
-      int flushQueueSize,
-      long flushIntervalInMillis,
-      Log log,
-      ThreadFactory threadFactory,
-      ExecutorService networkExecutor,
-      AtomicBoolean isShutDown,
-      String writeKey,
-      Gson gsonInstance) {
-    this.messageQueue = messageQueue;
+  public AnalyticsClient(HttpUrl uploadUrl, SegmentService service, Log log, ThreadFactory threadFactory,
+      ExecutorService networkExecutor, String writeKey, Gson gsonInstance, HttpConfig config, FileConfig fileConfig)
+      throws IOException {
+    this.config = config;
+    this.messageQueue = new LinkedBlockingQueue<Message>(config.queueSize);
     this.uploadUrl = uploadUrl;
     this.service = service;
-    this.flushQueueSize = flushQueueSize;
-        this.flushIntervalInMillis = flushIntervalInMillis;
     this.log = log;
     this.looperThread = threadFactory.newThread(new Looper());
+    this.looperThread.setName(AnalyticsClient.class.getSimpleName() + "-Looper");
     this.networkExecutor = networkExecutor;
-    this.isShutDown = isShutDown;
     this.writeKey = writeKey;
     this.gsonInstance = gsonInstance;
-        looperThread.start();
 
-        CircuitBreaker<Response<UploadResponse>> breaker = CircuitBreaker.<Response<UploadResponse>>builder()
-                // 10 failure in 2 minute open the circuit
-                .withFailureThreshold(10, Duration.ofMinutes(2))
-                // once open wait 30 seconds to be half-open
-                .withDelay(Duration.ofSeconds(30))
-                // after 1 success the circuit is closed
-                .withSuccessThreshold(1)
-                // 5xx or rate limit is an error
-                .handleResultIf(response -> is5xx(response.code()) || response.code() == 429)
-                .onOpen(el -> System.err.println("***\nOPEN\n***"))
-                .onHalfOpen(el -> System.err.println("***\nHALF OPEN\n***"))
-                .onClose(el -> System.err.println("***\nCLOSED\n***"))
-                .build();
+    this.breaker = CircuitBreaker.<Response<UploadResponse>>builder()
+	// X failure in 1 minute open the circuit
+	.withFailureThreshold(config.circuitErrorsInAMinute, Duration.ofMinutes(1))
+	// once open wait X seconds to be half-open
+	.withDelay(Duration.ofSeconds(config.circuitSecondsInOpen))
+	// after X success the circuit is closed
+	.withSuccessThreshold(config.circuitRequestToClose)
+	// 5xx or rate limit is an error
+	.handleResultIf(response -> is5xx(response.code()) || response.code() == 429)
+	.onOpen(el -> LOGGER.log(Level.INFO, "OPEN: failing requests"))
+	.onHalfOpen(el -> LOGGER.log(Level.INFO, "HALF OPEN: checking status"))
+	.onClose(el -> LOGGER.log(Level.INFO, "CLOSED: attending requests normally")).build();
 
-        RetryPolicy<Response<UploadResponse>> retry = RetryPolicy.<Response<UploadResponse>>builder()
-                .withMaxAttempts(5)
-                .withBackoff(1, 300, ChronoUnit.SECONDS)
-                .withJitter(.2)
-                // retry on IOException
-                .handle(IOException.class)
-                // retry on 5xx
-                .handleResultIf(response -> is5xx(response.code()))
-                // stop retry on rate limit
-                .abortIf(response -> response.code() == 429)
-                .build();
+    this.fallback = new FallbackAppender(gsonInstance, threadFactory, fileConfig);
+    this.resubmit = new ResubmitCheck(threadFactory, fileConfig, this);
 
-        this.failsafe = Failsafe.with(retry, breaker).with(networkExecutor);
-        this.fallback = new FallbackAppender(this);
+    looperThread.start();
   }
 
   public int messageSizeInBytes(Message message) {
     String stringifiedMessage = gsonInstance.toJson(message);
-
     return stringifiedMessage.getBytes(ENCODING).length;
   }
 
-  public boolean offer(Message message) {
+  public boolean offer(Message message) throws IllegalArgumentException {
+    if (messageSizeInBytes(message) > MSG_MAX_SIZE) {
+      throw new IllegalArgumentException("Message was above individual limit. MessageId: " + message.messageId());
+    }
+
     return messageQueue.offer(message);
   }
 
-    public void enqueue(Message message) {
-        if (isShutDown.get()) {
-            log.print(ERROR, "Attempt to enqueue a message when shutdown has been called %s.", message);
-            return;
-        }
-        if (!messageQueue.offer(message)) {
-            handleError(message);
-        }
-        else {
-            System.err.println("enqueued " + message.messageId());
-        }
+  public void enqueue(Message message) throws IllegalArgumentException {
+    if (isShutDown.get()) {
+      log.print(ERROR, "Attempt to enqueue a message when shutdown has been called %s.", message);
+      return;
     }
-    
+    if (!offer(message)) {
+      fallback.add(message);
+    } else {
+      LOGGER.log(Level.FINE, "enqueued " + message.messageId());
+    }
+  }
 
-    // FIXME closeable
-  public void shutdown() {
+  @Override
+  public void close() {
     if (isShutDown.compareAndSet(false, true)) {
       final long start = System.currentTimeMillis();
 
       // first let's tell the system to stop
       looperThread.interrupt();
       fallback.close();
+      resubmit.close();
 
       shutdownAndWait(networkExecutor, "network");
 
-      log.print(
-          VERBOSE, "Analytics client shut down in %s ms", (System.currentTimeMillis() - start));
+      log.print(VERBOSE, "Analytics client shut down in %s ms", (System.currentTimeMillis() - start));
     }
   }
 
-    private void shutdownAndWait(ExecutorService executor, String name) {
+  private void shutdownAndWait(ExecutorService executor, String name) {
     try {
       executor.shutdown();
       final boolean executorTerminated = executor.awaitTermination(1, TimeUnit.SECONDS);
 
-      log.print(
-          VERBOSE,
-          "%s executor %s.",
-          name,
-          executorTerminated ? "terminated normally" : "timed out");
+      log.print(VERBOSE, "%s executor %s.", name, executorTerminated ? "terminated normally" : "timed out");
     } catch (InterruptedException e) {
       log.print(ERROR, e, "Interrupted while stopping %s executor.", name);
       Thread.currentThread().interrupt();
@@ -205,8 +160,8 @@ public class AnalyticsClient {
   }
 
   /**
-   * Looper runs on a background thread and takes messages from the queue. Once it collects enough
-   * messages, it triggers a flush.
+   * Looper runs on a background thread and takes messages from the queue. Once it
+   * collects enough messages, it triggers a flush.
    */
   class Looper implements Runnable {
 
@@ -219,149 +174,187 @@ public class AnalyticsClient {
       int currentBatchSize = 0;
       boolean batchSizeLimitReached = false;
       int contextSize = gsonInstance.toJson(CONTEXT).getBytes(ENCODING).length;
+
+      long reportedAt = System.currentTimeMillis();
       try {
-          while (!Thread.currentThread().isInterrupted()) {
-          Message message = messageQueue.poll(flushIntervalInMillis, TimeUnit.MILLISECONDS);
+	while (!Thread.currentThread().isInterrupted()) {
+	  Message message = messageQueue.poll(config.flushIntervalInMillis, TimeUnit.MILLISECONDS);
 
-          if (message != null) {           
-            // we do  +1 because we are accounting for this new message we just took from the queue
-            // which is not in list yet
-            // need to check if this message is going to make us go over the limit considering
-            // default batch size as well
-            int defaultBatchSize =
-                BatchUtility.getBatchDefaultSize(contextSize, messages.size() + 1);
-            int msgSize = messageSizeInBytes(message);
-            if (currentBatchSize  + msgSize + defaultBatchSize <= BATCH_MAX_SIZE) {
-              messages.add(message);
-              currentBatchSize+=msgSize;
-            } else {
-              // put message that did not make the cut this time back on the queue, we already took
-              // this message if we dont put it back its lost
-              // we take care of that after submitting the batch
-              batchSizeLimitReached = true;
-            }
-          }
-          
-          if (messages.isEmpty()) {
-              continue;
-          }
+	  if (message != null) {
+	    // we do +1 because we are accounting for this new message we just took from the
+	    // queue
+	    // which is not in list yet
+	    // need to check if this message is going to make us go over the limit
+	    // considering
+	    // default batch size as well
+	    int defaultBatchSize = BatchUtility.getBatchDefaultSize(contextSize, messages.size() + 1);
+	    int msgSize = messageSizeInBytes(message);
+	    if (currentBatchSize + msgSize + defaultBatchSize <= BATCH_MAX_SIZE) {
+	      messages.add(message);
+	      currentBatchSize += msgSize;
+	    } else {
+	      // put message that did not make the cut this time back on the queue, we already
+	      // took
+	      // this message if we dont put it back its lost
+	      // we take care of that after submitting the batch
+	      batchSizeLimitReached = true;
+	    }
+	  }
 
-          Boolean isBlockingSignal = message == null;
-          Boolean isOverflow = messages.size() >= flushQueueSize;
+	  if (messages.isEmpty()) {
+	    continue;
+	  }
 
-          if (!messages.isEmpty() && (isOverflow || isBlockingSignal || batchSizeLimitReached)) {
-            Batch batch = Batch.create(CONTEXT, new ArrayList<>(messages), writeKey);
-            log.print(
-                VERBOSE,
-                "Batching %s message(s) into batch %s.",
-                batch.batch().size(),
-                batch.sequence());
+	  Boolean isBlockingSignal = message == null;
+	  Boolean isOverflow = messages.size() >= config.flushQueueSize;
 
-                Call<UploadResponse> call = service.upload(uploadUrl, batch);
-                FailsafeCall<UploadResponse> failsafeCall =
-                        FailsafeCall.with(failsafe).compose(call);
-                failsafeCall.executeAsync()
-                .thenAccept(r -> {
-                    if(is5xx(r.code()) || r.code() == 429) {
-                        handleError(batch, null);
-                    }
-                })
-                .exceptionally(t -> {
-                    handleError(batch, t);
-                    return null;
-                });
+	  if (!messages.isEmpty() && (isOverflow || isBlockingSignal || batchSizeLimitReached)) {
+	    Batch batch = Batch.create(CONTEXT, new ArrayList<>(messages), writeKey);
+	    log.print(VERBOSE, "Batching %s message(s) into batch %s.", batch.batch().size(), batch.sequence());
 
-            currentBatchSize = 0;
-            messages.clear();
-            if (batchSizeLimitReached) {
-              // If this is true that means the last message that would make us go over the limit
-              // was not added,
-              // add it to the now cleared messages list so its not lost
-              messages.add(message);
-            }
-            batchSizeLimitReached = false;
-          }
-        }
+	    networkExecutor.submit(new BatchUploadTask(breaker, service, batch, uploadUrl, fallback));
+
+	    currentBatchSize = 0;
+	    messages.clear();
+	    if (batchSizeLimitReached) {
+	      // If this is true that means the last message that would make us go over the
+	      // limit
+	      // was not added,
+	      // add it to the now cleared messages list so its not lost
+	      messages.add(message);
+	    }
+	    batchSizeLimitReached = false;
+	  }
+
+	  long now = System.currentTimeMillis();
+	  if (now - reportedAt > 2_000) {
+	    LOGGER.log(Level.FINE, "HTTPQueue: " + messageQueue.size());
+	    if (networkExecutor instanceof ThreadPoolExecutor) {
+	      ThreadPoolExecutor tpe = (ThreadPoolExecutor) networkExecutor;
+	      LOGGER.log(Level.FINE,
+		  String.format("HTTPPool active:%d", tpe.getActiveCount()));
+	    }
+	    reportedAt = now;
+	  }
+	}
       } catch (InterruptedException e) {
-        log.print(DEBUG, "Looper interrupted while polling for messages.");
-                // XXX CANCEL UPLOAD
-            } catch (Exception e) {
-                e.printStackTrace();
-            }
-      // SEND pending
+	log.print(DEBUG, "Looper interrupted while polling for messages.");
+	Thread.currentThread().interrupt();
+      }
+
+      isShutDown.compareAndSet(false, true);
+
+      Message msg = messageQueue.poll();
+      while (msg != null) {
+	fallback.add(msg);
+	msg = messageQueue.poll();
+      }
+
       log.print(VERBOSE, "Looper stopped");
     }
-    
-  }
-  
-  void handleError(Batch batch, Throwable t) {
-      if(t instanceof CompletionException ) {
-	  if(t.getCause() instanceof CircuitBreakerOpenException) {	      
-	      System.err.println("OPEN"); 
-	  }
-      }
-      for(Message msg : batch.batch()) {	  
-	  fallback.add(msg);
-      }
   }
 
-    void handleError(Message msg) {
-        fallback.add(msg);
+  private static boolean is5xx(int status) {
+    return status >= 500 && status < 600;
   }
 
-    private static boolean is5xx(int status) {
-      return status >= 500 && status < 600;
+  static interface SupplierWithException<T> {
+    T get() throws Exception;
   }
+
+  private static boolean upload(final CircuitBreaker<?> breaker,
+      SupplierWithException<Response<UploadResponse>> uploadRequest) {
+    if (breaker.tryAcquirePermit()) {
+      try {
+	Response<UploadResponse> upload = uploadRequest.get();
+	if (upload.isSuccessful()) {
+	  breaker.recordSuccess();
+	  // FIXME handle response ? do not retry those ?
+	  // upload.body().success())
+	  return true;
+	} else if (upload.code() == 429) {
+	  breaker.open();
+	} else {
+	  breaker.recordFailure();
+	}
+      } catch (Exception e) {
+	breaker.recordException(e);
+      }
+    }
+    return false;
+  }
+
+  static class BatchUploadTask implements Runnable {
+    final CircuitBreaker<?> breaker;
+    final SegmentService service;
+    final Batch batch;
+    final HttpUrl uploadUrl;
+    final FallbackAppender fallback;
+
+    BatchUploadTask(final CircuitBreaker<?> breaker, final SegmentService service, final Batch batch,
+	final HttpUrl uploadUrl, FallbackAppender fallback) {
+      this.breaker = breaker;
+      this.service = service;
+      this.batch = batch;
+      this.uploadUrl = uploadUrl;
+      this.fallback = fallback;
+    }
+
+    @Override
+    public void run() {
+      if (!upload(breaker, () -> service.upload(uploadUrl, batch).execute())) {
+	fallback.add(batch);
+      }
+    }
+  }
+
+  static class BatchUploadFileTask implements Runnable {
+    final CircuitBreaker<?> breaker;
+    final SegmentService service;
+    final Path path;
+    final Gson gson;
+    final HttpUrl uploadUrl;
+
+    static final MediaType JSON = MediaType.get("application/json");
+
+    BatchUploadFileTask(final CircuitBreaker<?> breaker, final SegmentService service, final Path path, Gson gson,
+	final HttpUrl uploadUrl) {
+      this.breaker = breaker;
+      this.service = service;
+      this.path = path;
+      this.gson = gson;
+      this.uploadUrl = uploadUrl;
+    }
+
+    @Override
+    public void run() {
+      if (upload(breaker,
+	  () -> service.upload(uploadUrl, RequestBody.create(path.toFile(), JSON)).execute())) {
+	try {
+	  Files.delete(path);
+	} catch (IOException e) {
+	  // will attempt to submit again (rename file?)
+	  LOGGER.log(Level.WARNING, "Cannot delete file " + path, e);
+	}
+      }
+    }
+  }
+
+  public void resubmit(Path path) {
+    networkExecutor.submit(new BatchUploadFileTask(breaker, service, path, gsonInstance, uploadUrl));
+  }
+
   public static class BatchUtility {
 
-    /**
-     * Method to determine what is the expected default size of the batch regardless of messages
-     *
-     * <p>Sample batch:
-     * {"batch":[{"type":"alias","messageId":"fc9198f9-d827-47fb-96c8-095bd3405d93","timestamp":"Nov
-     * 18, 2021, 2:45:07
-     * PM","userId":"jorgen25","integrations":{"someKey":{"data":"aaaaa"}},"previousId":"foo"},{"type":"alias",
-     * "messageId":"3ce6f88c-36cb-4991-83f8-157e10261a89","timestamp":"Nov 18, 2021, 2:45:07
-     * PM","userId":"jorgen25",
-     * "integrations":{"someKey":{"data":"aaaaa"}},"previousId":"foo"},{"type":"alias",
-     * "messageId":"a328d339-899a-4a14-9835-ec91e303ac4d","timestamp":"Nov 18, 2021, 2:45:07 PM",
-     * "userId":"jorgen25","integrations":{"someKey":{"data":"aaaaa"}},"previousId":"foo"},{"type":"alias",
-     * "messageId":"57b0ceb4-a1cf-4599-9fba-0a44c7041004","timestamp":"Nov 18, 2021, 2:45:07 PM",
-     * "userId":"jorgen25","integrations":{"someKey":{"data":"aaaaa"}},"previousId":"foo"}],
-     * "sentAt":"Nov 18, 2021, 2:45:07 PM","context":{"library":{"name":"analytics-java",
-     * "version":"3.1.3"}},"sequence":1,"writeKey":"XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"}
-     *
-     * <p>total size of batch : 932
-     *
-     * <p>BREAKDOWN: {"batch":[MESSAGE1,MESSAGE2,MESSAGE3,MESSAGE4],"sentAt":"MMM dd, yyyy, HH:mm:ss
-     * tt","context":CONTEXT,"sequence":1,"writeKey":"XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"}
-     *
-     * <p>so we need to account for: 1 -message size: 189 * 4 = 756 2 -context object size = 55 in
-     * this sample -> 756 + 55 = 811 3 -Metadata (This has the sent data/sequence characters) +
-     * extra chars (these are chars like "batch":[] or "context": etc and will be pretty much the
-     * same length in every batch -> size is 73 --> 811 + 73 = 884 (well 72 actually, char 73 is the
-     * sequence digit which we account for in point 5) 4 -Commas between each message, the total
-     * number of commas is number_of_msgs - 1 = 3 -> 884 + 3 = 887 (sample is 886 because the hour
-     * in sentData this time happens to be 2:45 but it could be 12:45 5 -Sequence Number increments
-     * with every batch created
-     *
-     * <p>so formulae to determine the expected default size of the batch is
-     *
-     * @return: defaultSize = messages size + context size + metadata size + comma number + sequence
-     *     digits + writekey + buffer
-     * @return
-     */
     private static int getBatchDefaultSize(int contextSize, int currentMessageNumber) {
-      // sample data: {"batch":[],"sentAt":"MMM dd, yyyy, HH:mm:ss tt","context":,"sequence":1,
-      //   "writeKey":"XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"} - 119
+      // sample data: {"batch":[],"sentAt":"MMM dd, yyyy, HH:mm:ss
+      // tt","context":,"sequence":1,
+      // "writeKey":"XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"} - 119
       // Don't need to squeeze everything possible into a batch, adding a buffer
       int metadataExtraCharsSize = 119 + 1024;
       int commaNumber = currentMessageNumber - 1;
 
-      return contextSize
-          + metadataExtraCharsSize
-          + commaNumber
-          + String.valueOf(Integer.MAX_VALUE).length();
+      return contextSize + metadataExtraCharsSize + commaNumber + String.valueOf(Integer.MAX_VALUE).length();
     }
   }
 }
