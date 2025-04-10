@@ -17,16 +17,16 @@ import com.segment.analytics.internal.FallbackAppender;
 import com.segment.analytics.messages.TrackMessage;
 import java.io.IOException;
 import java.nio.file.Path;
-import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.HashSet;
 import java.util.Iterator;
-import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingDeque;
 import java.util.concurrent.SynchronousQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.ThreadPoolExecutor.CallerRunsPolicy;
@@ -119,7 +119,9 @@ public class SegmentTest {
                         .queueSize(SEGMENT_QUEUE_SIZE_DEFAULT)
                         .flushIntervalInMillis(DEFAULT_FLUSH_PERIOD_IN_SECONDS * 1_000)
                         .build())
-                .fileConfig(FileConfig.builder().build())
+                .fileConfig(FileConfig.builder()
+                    //.size(10_000).flushSize(300)
+                    .build())
                 .build();
     }
 
@@ -160,16 +162,18 @@ public class SegmentTest {
 	int responseDelay = 300;
 
         stubFor(post(urlEqualTo("/v1/import/"))
-                .willReturn(
-                        WireMock.aResponse().withStatus(503).withBody("fail").withFixedDelay(responseDelay)));
+            .willReturn(
+                WireMock.aResponse().withStatus(503).withBody("fail").withFixedDelay(responseDelay)));
 
         long start = System.currentTimeMillis();
         boolean upAgain = false;
         final AtomicInteger id = new AtomicInteger(0);
-        List<String> ids = new ArrayList<>();
 
+	Collection<String> ids = new ConcurrentLinkedQueue<>();
         RateLimiter rate = RateLimiter.create(requestsPerSecond);
-        ExecutorService exec = Executors.newWorkStealingPool(numClients);
+
+	ExecutorService exec = new ThreadPoolExecutor(numClients, numClients, 15l, TimeUnit.SECONDS,
+	    new LinkedBlockingDeque<>(10_000), new CallerRunsPolicy());
 
         while (System.currentTimeMillis() - start < timeToRun) {
             if (rate.tryAcquire()) {
@@ -190,13 +194,15 @@ public class SegmentTest {
             }
         }
 
-        Awaitility.await()
-                .atMost(10, TimeUnit.MINUTES)
-                .pollInterval(1, TimeUnit.SECONDS)
-                .until(() -> sentMessagesEqualsTo(ids.toArray(new String[ids.size()])));
+	exec.shutdown();
+	exec.awaitTermination(10, TimeUnit.MINUTES);
 
-        exec.shutdownNow();
-        exec.awaitTermination(10, TimeUnit.SECONDS);
+
+	Awaitility.await()
+	        .atMost(10, TimeUnit.MINUTES)
+	        .pollInterval(1, TimeUnit.SECONDS)
+	        .until(() -> sentMessagesEqualsTo(ids.toArray(new String[ids.size()])));
+
     }
 
     private static final ObjectMapper OM = new ObjectMapper();
@@ -204,10 +210,12 @@ public class SegmentTest {
     private boolean sentMessagesEqualsTo(String... msgIds) {
         Set<String> sentMessages = sentMessages();
         System.err.println("Confirmed msgs %d / %d ".formatted(sentMessages.size(), msgIds.length));
-        return sentMessages().equals(new HashSet<>(Arrays.asList(msgIds)));
+
+	return sentMessages.equals(new HashSet<>(Arrays.asList(msgIds)));
     }
 
     private Set<String> sentMessages() {
+      int count = 0;
         Set<String> messageIds = new HashSet<>();
         for (ServeEvent event : wireMockRule.getAllServeEvents()) {
             if (event.getResponse().getStatus() != 200) {
@@ -226,9 +234,13 @@ public class SegmentTest {
             }
             Iterator<JsonNode> msgs = batch.elements();
             while (msgs.hasNext()) {
+	        count++;
                 messageIds.add(msgs.next().get("messageId").asText());
             }
         }
+	if (count != messageIds.size()) {
+	  System.err.println(String.format("Duplicates!, count: %d messageIds: %d", count, messageIds.size()));
+	}
         return messageIds;
     }
 }

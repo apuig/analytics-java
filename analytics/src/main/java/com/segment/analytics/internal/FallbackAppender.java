@@ -187,7 +187,8 @@ public class FallbackAppender implements Closeable {
 	FileLock fileLock = fileChannel.lock();) {
 
       long currentFileSize = fileChannel.size();
-      if (currentFileSize == 0) {
+      boolean first = currentFileSize == 0;
+      if (first) {
 	os.write(BATCH_BEGIN);
       }
 
@@ -201,8 +202,12 @@ public class FallbackAppender implements Closeable {
 	  return batch.subList(i, batch.size());
 	}
 
+	if (first) {
+	  first = false;
+	} else {
+	  os.write(COMMA);
+	}
 	os.write(msgBytes);
-	os.write(COMMA);
       }
 
       fileChannel.force(true);
