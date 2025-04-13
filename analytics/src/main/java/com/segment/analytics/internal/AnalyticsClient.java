@@ -74,7 +74,7 @@ public class AnalyticsClient implements Closeable {
   private final ResubmitCheck resubmit;
 
   public AnalyticsClient(HttpUrl uploadUrl, SegmentService service, Log log, ThreadFactory threadFactory,
-      ExecutorService networkExecutor, String writeKey, Gson gsonInstance, HttpConfig config, FileConfig fileConfig)
+      String writeKey, Gson gsonInstance, HttpConfig config, FileConfig fileConfig)
       throws IOException {
     this.config = config;
     this.messageQueue = new LinkedBlockingQueue<Message>(config.queueSize);
@@ -83,7 +83,7 @@ public class AnalyticsClient implements Closeable {
     this.log = log;
     this.looperThread = threadFactory.newThread(new Looper());
     this.looperThread.setName(AnalyticsClient.class.getSimpleName() + "-Looper");
-    this.networkExecutor = networkExecutor;
+    this.networkExecutor = config.executor;
     this.writeKey = writeKey;
     this.gsonInstance = gsonInstance;
 
@@ -127,7 +127,7 @@ public class AnalyticsClient implements Closeable {
     if (!offer(message)) {
       fallback.add(message);
     } else {
-      LOGGER.log(Level.FINE, "enqueued " + message.messageId());
+      LOGGER.log(Level.FINE, "enqueued {0}", message.messageId());
     }
   }
 
@@ -212,7 +212,7 @@ public class AnalyticsClient implements Closeable {
 	    Batch batch = Batch.create(CONTEXT, new ArrayList<>(messages), writeKey);
 	    log.print(VERBOSE, "Batching %s message(s) into batch %s.", batch.batch().size(), batch.sequence());
 
-	    networkExecutor.submit(new BatchUploadTask(breaker, service, batch, uploadUrl, fallback));
+	    networkExecutor.submit(new UploadBatchTask(breaker, service, uploadUrl, batch,  fallback));
 
 	    currentBatchSize = 0;
 	    messages.clear();
@@ -228,11 +228,10 @@ public class AnalyticsClient implements Closeable {
 
 	  long now = System.currentTimeMillis();
 	  if (now - reportedAt > 2_000) {
-	    LOGGER.log(Level.FINE, "HTTPQueue: " + messageQueue.size());
+	    LOGGER.log(Level.FINE, "HTTPQueue: {0}", messageQueue.size());
 	    if (networkExecutor instanceof ThreadPoolExecutor) {
 	      ThreadPoolExecutor tpe = (ThreadPoolExecutor) networkExecutor;
-	      LOGGER.log(Level.FINE,
-		  String.format("HTTPPool active:%d", tpe.getActiveCount()));
+	      LOGGER.log(Level.FINE, "HTTPPool active:{0}", tpe.getActiveCount());
 	    }
 	    reportedAt = now;
 	  }
@@ -262,74 +261,73 @@ public class AnalyticsClient implements Closeable {
     T get() throws Exception;
   }
 
-  private static boolean upload(final CircuitBreaker<?> breaker,
-      SupplierWithException<Response<UploadResponse>> uploadRequest) {
-    if (breaker.tryAcquirePermit()) {
-      try {
-	Response<UploadResponse> upload = uploadRequest.get();
-	if (upload.isSuccessful()) {
-	  breaker.recordSuccess();
-	  // FIXME handle response ? do not retry those ?
-	  // upload.body().success())
-	  return true;
-	} else if (upload.code() == 429) {
-	  breaker.open();
-	} else {
-	  breaker.recordFailure();
-	}
-      } catch (Exception e) {
-	breaker.recordException(e);
-      }
-    }
-    return false;
-  }
 
-  static class BatchUploadTask implements Runnable {
-    final CircuitBreaker<?> breaker;
-    final SegmentService service;
+  
+  static abstract class UploadTask implements Runnable{
+      final CircuitBreaker<?> breaker;
+      final SegmentService service;
+      final HttpUrl uploadUrl;
+    public UploadTask(CircuitBreaker<?> breaker, SegmentService service, HttpUrl uploadUrl) {
+        this.breaker = breaker;
+        this.service = service;
+        this.uploadUrl = uploadUrl;
+    }
+
+        boolean upload(SupplierWithException<Response<UploadResponse>> uploadRequest) {
+            if (breaker.tryAcquirePermit()) {
+                try {
+                    Response<UploadResponse> upload = uploadRequest.get();
+                    if (upload.isSuccessful()) {
+                        breaker.recordSuccess();
+                        // FIXME handle response ? do not retry those ?
+                        // upload.body().success())
+                        return true;
+                    } else if (upload.code() == 429) {
+                        breaker.open();
+                    } else {
+                        breaker.recordFailure();
+                }
+                } catch (Exception e) {
+                    breaker.recordException(e);
+            }
+        }
+            return false;
+        }
+  }
+  
+  static class UploadBatchTask extends UploadTask {
+
     final Batch batch;
-    final HttpUrl uploadUrl;
     final FallbackAppender fallback;
 
-    BatchUploadTask(final CircuitBreaker<?> breaker, final SegmentService service, final Batch batch,
-	final HttpUrl uploadUrl, FallbackAppender fallback) {
-      this.breaker = breaker;
-      this.service = service;
+    UploadBatchTask(final CircuitBreaker<?> breaker, final SegmentService service, final HttpUrl uploadUrl, final Batch batch
+	, FallbackAppender fallback) {
+      super(breaker, service, uploadUrl);
       this.batch = batch;
-      this.uploadUrl = uploadUrl;
       this.fallback = fallback;
     }
 
     @Override
     public void run() {
-      if (!upload(breaker, () -> service.upload(uploadUrl, batch).execute())) {
+      if (!upload(() -> service.upload(uploadUrl, batch).execute())) {
 	fallback.add(batch);
       }
     }
   }
 
-  static class BatchUploadFileTask implements Runnable {
-    final CircuitBreaker<?> breaker;
-    final SegmentService service;
+  static class UploadFileTask extends UploadTask {
     final Path path;
-    final Gson gson;
-    final HttpUrl uploadUrl;
 
     static final MediaType JSON = MediaType.get("application/json");
 
-    BatchUploadFileTask(final CircuitBreaker<?> breaker, final SegmentService service, final Path path, Gson gson,
-	final HttpUrl uploadUrl) {
-      this.breaker = breaker;
-      this.service = service;
+    UploadFileTask(final CircuitBreaker<?> breaker, final SegmentService service, final HttpUrl uploadUrl, final Path path) {
+      super(breaker, service, uploadUrl);
       this.path = path;
-      this.gson = gson;
-      this.uploadUrl = uploadUrl;
     }
 
     @Override
     public void run() {
-      if (upload(breaker,
-	  () -> service.upload(uploadUrl, RequestBody.create(path.toFile(), JSON)).execute())) {
+      if (upload(() -> service.upload(uploadUrl, RequestBody.create(path.toFile(), JSON)).execute())) {
 	try {
 	  Files.delete(path);
 	} catch (IOException e) {
@@ -341,7 +339,7 @@ public class AnalyticsClient implements Closeable {
   }
 
   public void resubmit(Path path) {
-    networkExecutor.submit(new BatchUploadFileTask(breaker, service, path, gsonInstance, uploadUrl));
+    networkExecutor.submit(new UploadFileTask(breaker, service, uploadUrl, path));
   }
 
   public static class BatchUtility {

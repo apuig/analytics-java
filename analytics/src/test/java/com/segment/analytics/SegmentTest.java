@@ -9,36 +9,23 @@ import static com.github.tomakehurst.wiremock.core.WireMockConfiguration.wireMoc
 import com.github.tomakehurst.wiremock.client.WireMock;
 import com.github.tomakehurst.wiremock.junit.WireMockRule;
 import com.github.tomakehurst.wiremock.stubbing.ServeEvent;
-import com.segment.analytics.internal.AnalyticsClient;
 import com.segment.analytics.internal.Config;
 import com.segment.analytics.internal.Config.FileConfig;
 import com.segment.analytics.internal.Config.HttpConfig;
-import com.segment.analytics.internal.FallbackAppender;
 import com.segment.analytics.messages.TrackMessage;
 import java.io.IOException;
 import java.nio.file.Path;
-import java.util.Arrays;
-import java.util.Collection;
+import java.time.Duration;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.ArrayBlockingQueue;
-import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.LinkedBlockingDeque;
-import java.util.concurrent.SynchronousQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.ThreadPoolExecutor.CallerRunsPolicy;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.logging.ConsoleHandler;
-import java.util.logging.Level;
-import java.util.logging.LogRecord;
-import java.util.logging.Logger;
-import java.util.logging.SimpleFormatter;
-import okhttp3.Dispatcher;
-import okhttp3.OkHttpClient;
 import org.apache.commons.io.FileUtils;
 import org.apache.commons.lang.RandomStringUtils;
 import org.awaitility.Awaitility;
@@ -53,170 +40,135 @@ import wiremock.com.google.common.util.concurrent.RateLimiter;
 
 public class SegmentTest {
 
+    public int requestsPerSecond = 1_000;
+    public int numClients = 10;
+    public int messageContentChars = 100;
+    public int responseDelay = 300;
+
     @Rule
-    public WireMockRule wireMockRule = new WireMockRule(
-            wireMockConfig()
-                    .port(8088)
-                    // .dynamicPort()
-                    .gzipDisabled(true),
-            false);
+    public WireMockRule wireMockRule =
+            new WireMockRule(wireMockConfig().port(8088).gzipDisabled(true), false);
 
     Analytics analytics;
 
     @Before
-    public void confWireMockAndClient() throws IOException {
+    public void setup() throws IOException {
         FileUtils.deleteDirectory(Path.of(Config.DEFAULT_FALLBACK_FILE).toFile());
-
-        stubFor(post(urlEqualTo("/v1/import/")).willReturn(okJson("{\"success\": \"true\"}")));
-
-        // from SegmentQueue
-        Integer SEGMENT_FLUSH_QUEUE_SIZE_DEFAULT = 50;
-	Integer SEGMENT_QUEUE_SIZE_DEFAULT = 250;
-        Integer DEFAULT_FLUSH_PERIOD_IN_SECONDS = 10;
-
-        // from SegmentQueue getBoundedNetworkExecutor
-        Integer SEGMENT_EXECUTOR_QUEU_SIZE_DEFAULT = 0; // 5;
-        Integer EXECUTOR_SIZE = 1;
-        Integer EXECUTOR_KEEPALIVE_SECONDS = 15;
-
-        ThreadPoolExecutor boundedNetworkExecutor = new ThreadPoolExecutor(
-                EXECUTOR_SIZE, // corePoolSize
-                EXECUTOR_SIZE, // maximumPoolSize
-                EXECUTOR_KEEPALIVE_SECONDS, // keepAliveTime
-                TimeUnit.SECONDS,
-                SEGMENT_EXECUTOR_QUEU_SIZE_DEFAULT == 0
-                        ? new SynchronousQueue<>(true)
-                        : new ArrayBlockingQueue<>(SEGMENT_EXECUTOR_QUEU_SIZE_DEFAULT, true),
-                // this will cause the HTTP requests to be handled on AnalyticsClient.Looper
-                // SegmentQueue was discarding oldest tasks // e.getQueue().poll(); e.execute(r);
-                new CallerRunsPolicy() {
-                    public void rejectedExecution(Runnable r, ThreadPoolExecutor e) {
-                        // System.err.println("==== Pool exhausted ====");
-                        super.rejectedExecution(r, e);
-                    }
-                    ;
-                });
-
-        // segment Platform getDefaultClient
-        Integer HTTP_TIMEOUT_SECONDS = 15;
-        OkHttpClient client = new OkHttpClient.Builder()
-                .connectTimeout(HTTP_TIMEOUT_SECONDS, TimeUnit.SECONDS)
-                .readTimeout(HTTP_TIMEOUT_SECONDS, TimeUnit.SECONDS)
-                .writeTimeout(HTTP_TIMEOUT_SECONDS, TimeUnit.SECONDS)
-                // addedd bounded executor
-                .dispatcher(new Dispatcher(boundedNetworkExecutor))
-                .build();
-
-        // Then it always add the user-agent interceptor
-        // FIXME not forcing tls
 
         analytics = Analytics.builder("write-key")
                 .endpoint(wireMockRule.baseUrl())
-                .client(client)
-                .networkExecutor(boundedNetworkExecutor)
                 .httpConfig(HttpConfig.builder()
-                        .flushQueueSize(SEGMENT_FLUSH_QUEUE_SIZE_DEFAULT)
-                        .queueSize(SEGMENT_QUEUE_SIZE_DEFAULT)
-                        .flushIntervalInMillis(DEFAULT_FLUSH_PERIOD_IN_SECONDS * 1_000)
+                        // .queueSize(250)
+                        // .flushQueueSize(50)
+                        // .flushIntervalInMillis(10 * 1_000)
+                        // .executorSize(1)
+                        // .executorQueueSize(0)
+                        // .timeoutSeconds(15)
                         .build())
                 .fileConfig(FileConfig.builder()
-                    //.size(10_000).flushSize(300)
-                    .build())
+                        // .size(250)
+                        // .flushSize(50)
+                        .build())
                 .build();
     }
 
-    @After
-    public void tearDown() {
-        analytics.close();
-    }
-
-    static void configLogger() {
-        ConsoleHandler console = new ConsoleHandler();
-        console.setLevel(Level.ALL);
-        console.setFormatter(new SimpleFormatter() {
-            @Override
-            public String format(LogRecord record) {
-                return String.format("[%1$tT.%1$tL] %2$s %n", record.getMillis(), record.getMessage());
-            }
-        });
-
-        Logger l1 = Logger.getLogger(FallbackAppender.class.getName());
-        Logger l2 = Logger.getLogger(AnalyticsClient.class.getName());
-        l1.setLevel(Level.ALL);
-        l1.addHandler(console);
-        l2.setLevel(Level.ALL);
-        l2.addHandler(console);
+   
+    @Test
+    public void testOk() throws Throwable {
+        run(Duration.ofSeconds(30), new TimedAction(Duration.ZERO, () -> segmentHttpUp()));
     }
 
     @Test
-    public void test() throws Throwable {
-        configLogger();
+    public void testFailRestoreAtEnd() throws Throwable {
+        Duration duration = Duration.ofSeconds(30);
+        run(
+                duration,
+                new TimedAction(Duration.ZERO, () -> segmentHttpDown()),
+                new TimedAction(duration, () -> segmentHttpUp()));
+    }
 
-	int requestsPerSecond = 1_000;
-        int numClients = 10;
-	int messageContentChars = 100;
+    @Test
+    public void testFailThenRestore() throws Throwable {
+        run(
+                Duration.ofMinutes(2),
+                new TimedAction(Duration.ZERO, () -> segmentHttpDown()),
+                new TimedAction(Duration.ofMinutes(1), () -> segmentHttpUp()));
+    }
 
-	int timeToRun = 60_000 * 2;
-	int timeToRestore = 60_000 * 1;
-
-	int responseDelay = 300;
-
-        stubFor(post(urlEqualTo("/v1/import/"))
-            .willReturn(
-                WireMock.aResponse().withStatus(503).withBody("fail").withFixedDelay(responseDelay)));
-
+    private void run(Duration durationToRun, TimedAction... actions) throws Throwable {
+        long timeToRun = durationToRun.toMillis();
         long start = System.currentTimeMillis();
-        boolean upAgain = false;
+
+        final String content = RandomStringUtils.randomAlphanumeric(messageContentChars);
         final AtomicInteger id = new AtomicInteger(0);
 
-	Collection<String> ids = new ConcurrentLinkedQueue<>();
+        ExecutorService exec = new ThreadPoolExecutor(
+                numClients,
+                numClients,
+                15l,
+                TimeUnit.SECONDS,
+                new LinkedBlockingDeque<>(10_000),
+                new CallerRunsPolicy());
+
         RateLimiter rate = RateLimiter.create(requestsPerSecond);
+        int actionIndex = 0;
+        while (true) {
+            long elapsed = System.currentTimeMillis() - start;
 
-	ExecutorService exec = new ThreadPoolExecutor(numClients, numClients, 15l, TimeUnit.SECONDS,
-	    new LinkedBlockingDeque<>(10_000), new CallerRunsPolicy());
+            if (actionIndex < actions.length && actions[actionIndex].at <= elapsed) {
+                actions[actionIndex].action.run();
+                actionIndex++;
+            }
 
-        while (System.currentTimeMillis() - start < timeToRun) {
+            if (elapsed > timeToRun) {
+                break;
+            }
+
             if (rate.tryAcquire()) {
                 exec.submit(() -> {
-                    String msgid = "m" + id.getAndIncrement();
-                    ids.add(msgid);
-                    analytics.enqueue(
-		      TrackMessage.builder("my-track").messageId(msgid).userId("userId")
-			  .context(Map.of("content", RandomStringUtils.randomAlphanumeric(messageContentChars))));
+                    String msgid = String.valueOf(id.getAndIncrement());
+                    analytics.enqueue(TrackMessage.builder("my-track")
+                            .messageId(msgid)
+                            .userId("userId")
+                            .context(Map.of("content", content)));
                 });
             }
-
-            if (!upAgain && System.currentTimeMillis() - start > timeToRestore) {
-                upAgain = true;
-                stubFor(post(urlEqualTo("/v1/import/"))
-                        .willReturn(okJson("{\"success\": \"true\"}").withFixedDelay(responseDelay)));
-                System.err.println("UP AGAIN");
-            }
+            Thread.yield();
         }
 
-	exec.shutdown();
-	exec.awaitTermination(10, TimeUnit.MINUTES);
+        exec.shutdown();
+        exec.awaitTermination(10, TimeUnit.MINUTES);
 
+        Awaitility.await()
+                .atMost(10, TimeUnit.MINUTES)
+                .pollInterval(1, TimeUnit.SECONDS)
+                .until(() -> checkSentMessages(id.get()));
+    }
 
-	Awaitility.await()
-	        .atMost(10, TimeUnit.MINUTES)
-	        .pollInterval(1, TimeUnit.SECONDS)
-	        .until(() -> sentMessagesEqualsTo(ids.toArray(new String[ids.size()])));
+    void segmentHttpUp() {
+        stubFor(post(urlEqualTo("/v1/import/"))
+                .willReturn(okJson("{\"success\": \"true\"}").withFixedDelay(responseDelay)));
+        System.err.println("HTTP server UP");
+    }
 
+    void segmentHttpDown() {
+        stubFor(post(urlEqualTo("/v1/import/"))
+                .willReturn(
+                        WireMock.aResponse().withStatus(503).withBody("fail").withFixedDelay(responseDelay)));
+        System.err.println("HTTP server DOWN");
     }
 
     private static final ObjectMapper OM = new ObjectMapper();
 
-    private boolean sentMessagesEqualsTo(String... msgIds) {
-        Set<String> sentMessages = sentMessages();
-        System.err.println("Confirmed msgs %d / %d ".formatted(sentMessages.size(), msgIds.length));
-
-	return sentMessages.equals(new HashSet<>(Arrays.asList(msgIds)));
+    private boolean checkSentMessages(int expected) {
+        int sentMessages = countSendMessages();
+        System.err.println("Confirmed msgs %d / %d ".formatted(sentMessages, expected));
+        return sentMessages >= expected;
     }
 
-    private Set<String> sentMessages() {
-      int count = 0;
-        Set<String> messageIds = new HashSet<>();
+    private int countSendMessages() {
+        int count = 0;
+        Set<Integer> messageIds = new HashSet<>();
         for (ServeEvent event : wireMockRule.getAllServeEvents()) {
             if (event.getResponse().getStatus() != 200) {
                 continue;
@@ -234,13 +186,29 @@ public class SegmentTest {
             }
             Iterator<JsonNode> msgs = batch.elements();
             while (msgs.hasNext()) {
-	        count++;
-                messageIds.add(msgs.next().get("messageId").asText());
+                count++;
+                messageIds.add(msgs.next().get("messageId").asInt());
             }
         }
-	if (count != messageIds.size()) {
-	  System.err.println(String.format("Duplicates!, count: %d messageIds: %d", count, messageIds.size()));
-	}
-        return messageIds;
+        if (count != messageIds.size()) {
+            System.err.println(String.format("Duplicates!, count: %d messageIds: %d", count, messageIds.size()));
+        }
+        return messageIds.size();
+    }
+
+    @After
+    public void tearDown() {
+        analytics.close();
+    }
+
+    static class TimedAction {
+        final long at;
+        final Runnable action;
+
+        public TimedAction(Duration at, Runnable run) {
+            super();
+            this.at = at.toMillis();
+            this.action = run;
+        }
     }
 }

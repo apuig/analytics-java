@@ -1,42 +1,37 @@
 package com.segment.analytics.internal;
 
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.concurrent.SynchronousQueue;
 import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.ThreadPoolExecutor.CallerRunsPolicy;
 import java.util.concurrent.TimeUnit;
+import okhttp3.Dispatcher;
 import okhttp3.OkHttpClient;
 
 public class Config {
 
-    public static final int DEFAULT_FALLBACK_QUEUE_SIZE = 250;
-    public static final int DEFAULT_FALLBACK_QUEUE_FLUSH_SIZE = 50;
-    public static final int DEFAULT_FALLBACK_QUEUE_FLUSH_MS = 2_000;
-    public static final String DEFAULT_FALLBACK_FILE = "pending";
-
-    //
-
-    public static final int DEFAULT_HTTP_QUEUE_SIZE = Integer.MAX_VALUE;
-    public static final int DEFAULT_HTTP_QUEUE_FLUSH = 250;
+    // from SegmentQueue
+    public static final int DEFAULT_HTTP_QUEUE_SIZE = 250; // analytics-java Integer.MAX_VALUE;
+    public static final int DEFAULT_HTTP_QUEUE_FLUSH = 50; // analytics-java 250;
     public static final int DEFAULT_HTTP_QUEUE_FLUSH_MS = 10 * 1000;
+
+    public static final int DEFAULT_HTTP_EXECUTOR_SIZE = 1;
+    public static final int DEFAULT_HTTP_EXECUTOR_QUEUE_SIZE = 0; // SegmentQueue  5;
+
+    public static final int DEFAULT_HTTP_TIMEOUT_SECONDS = 15;
 
     public static final int DEFAULT_HTTP_CIRCUIT_ERRORS_IN_A_MINUTE = 10;
     public static final int DEFAULT_HTTP_CIRCUIT_SECONDS_IN_OPEN = 30;
     public static final int DEFAULT_HTTP_CIRCUIT_REQUESTS_TO_CLOSE = 1;
 
-    //
-
-    public static OkHttpClient defaultClient() {
-        OkHttpClient client = new OkHttpClient.Builder()
-                .connectTimeout(15, TimeUnit.SECONDS)
-                .readTimeout(15, TimeUnit.SECONDS)
-                .writeTimeout(15, TimeUnit.SECONDS)
-                .build();
-        return client;
-    }
-
-    public static ExecutorService defaultNetworkExecutor() {
-        return Executors.newSingleThreadExecutor(defaultThreadFactory());
-    }
+    // FALLBACK
+    public static final int DEFAULT_FALLBACK_QUEUE_SIZE = 250;
+    public static final int DEFAULT_FALLBACK_QUEUE_FLUSH_SIZE = 50;
+    public static final int DEFAULT_FALLBACK_QUEUE_FLUSH_MS = 2_000;
+    public static final int DEFAULT_FALLBACK_ROLLOVER_TIMEOUT_SECONDS = 60;
+    public static final String DEFAULT_FALLBACK_FILE = "pending";
 
     public static ThreadFactory defaultThreadFactory() {
         return new ThreadFactory() {
@@ -62,6 +57,9 @@ public class Config {
         final int circuitSecondsInOpen;
         final int circuitRequestToClose;
 
+        final ExecutorService executor;
+        public OkHttpClient client; // Analytics touch the instance
+
         private HttpConfig(Builder builder) {
             this.queueSize = builder.queueSize;
             this.flushQueueSize = builder.flushQueueSize;
@@ -69,6 +67,32 @@ public class Config {
             this.circuitErrorsInAMinute = builder.circuitErrorsInAMinute;
             this.circuitSecondsInOpen = builder.circuitSecondsInOpen;
             this.circuitRequestToClose = builder.circuitRequestToClose;
+
+            this.executor = new ThreadPoolExecutor(
+                    builder.executorSize,
+                    builder.executorSize,
+                    15,
+                    TimeUnit.SECONDS,
+                    builder.executorQueueSize == 0
+                            ? new SynchronousQueue<>(true)
+                            : new ArrayBlockingQueue<>(builder.executorQueueSize, true),
+                    // this will cause the HTTP requests to be handled on AnalyticsClient.Looper
+                    // SegmentQueue was discarding oldest tasks // e.getQueue().poll(); e.execute(r);
+                    new CallerRunsPolicy() {
+                        public void rejectedExecution(Runnable r, ThreadPoolExecutor e) {
+                            // System.err.println("==== NetowrkPool exhausted, running in %s
+                            // ====".formatted(Thread.currentThread().getName()));
+                            super.rejectedExecution(r, e);
+                        }
+                    });
+
+            this.client = new OkHttpClient.Builder()
+                    .connectTimeout(builder.timeoutSeconds, TimeUnit.SECONDS)
+                    .readTimeout(builder.timeoutSeconds, TimeUnit.SECONDS)
+                    .writeTimeout(builder.timeoutSeconds, TimeUnit.SECONDS)
+                    // use same executor
+                    .dispatcher(new Dispatcher(this.executor))
+                    .build();
         }
 
         public static Builder builder() {
@@ -83,6 +107,10 @@ public class Config {
             private int circuitErrorsInAMinute = DEFAULT_HTTP_CIRCUIT_ERRORS_IN_A_MINUTE;
             private int circuitSecondsInOpen = DEFAULT_HTTP_CIRCUIT_SECONDS_IN_OPEN;
             private int circuitRequestToClose = DEFAULT_HTTP_CIRCUIT_REQUESTS_TO_CLOSE;
+
+            private int executorSize = DEFAULT_HTTP_EXECUTOR_SIZE;
+            private int executorQueueSize = DEFAULT_HTTP_EXECUTOR_QUEUE_SIZE;
+            private int timeoutSeconds = DEFAULT_HTTP_TIMEOUT_SECONDS;
 
             public Builder queueSize(int value) {
                 if (value <= 0) {
@@ -124,6 +152,21 @@ public class Config {
                 return this;
             }
 
+            public Builder executorSize(int value) {
+                this.executorSize = value;
+                return this;
+            }
+
+            public Builder executorQueueSize(int value) {
+                this.executorQueueSize = value;
+                return this;
+            }
+
+            public Builder timeoutSeconds(int value) {
+                this.timeoutSeconds = value;
+                return this;
+            }
+
             public HttpConfig build() {
                 return new HttpConfig(this);
             }
@@ -139,12 +182,15 @@ public class Config {
         final int flushMs;
         /** path to save pending messages */
         final String filePath;
+        /** max time to keep a open overflow file before finish the batch */
+        final int rolloverTimeoutSeconds;
 
         private FileConfig(Builder builder) {
             this.size = builder.size;
             this.flushSize = builder.flushSize;
             this.flushMs = builder.flushMs;
             this.filePath = builder.filePath;
+            this.rolloverTimeoutSeconds = builder.rolloverTimeoutSeconds;
         }
 
         public static Builder builder() {
@@ -156,6 +202,7 @@ public class Config {
             private int flushSize = DEFAULT_FALLBACK_QUEUE_FLUSH_SIZE;
             private int flushMs = DEFAULT_FALLBACK_QUEUE_FLUSH_MS;
             private String filePath = DEFAULT_FALLBACK_FILE;
+            private int rolloverTimeoutSeconds = DEFAULT_FALLBACK_ROLLOVER_TIMEOUT_SECONDS;
 
             public Builder size(int value) {
                 this.size = value;
@@ -174,6 +221,11 @@ public class Config {
 
             public Builder filePath(String value) {
                 this.filePath = value;
+                return this;
+            }
+
+            public Builder rolloverTimeoutSeconds(int value) {
+                this.rolloverTimeoutSeconds = value;
                 return this;
             }
 

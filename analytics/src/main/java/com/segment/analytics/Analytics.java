@@ -131,14 +131,12 @@ public class Analytics implements Closeable {
     private static final String DEFAULT_USER_AGENT = "analytics-java/" + AnalyticsVersion.get();
 
     private final String writeKey;
-    private OkHttpClient client;
     private Log log;
     public HttpUrl endpoint;
     public HttpUrl uploadURL;
     private String userAgent = DEFAULT_USER_AGENT;
     private List<MessageTransformer> messageTransformers;
     private List<MessageInterceptor> messageInterceptors;
-    private ExecutorService networkExecutor;
     private ThreadFactory threadFactory;
     private boolean forceTlsV1 = false;
     private GsonBuilder gsonBuilder;
@@ -150,15 +148,6 @@ public class Analytics implements Closeable {
         throw new NullPointerException("writeKey cannot be null or empty.");
       }
       this.writeKey = writeKey;
-    }
-
-    /** Set a custom networking client. */
-    public Builder client(OkHttpClient client) {
-      if (client == null) {
-        throw new NullPointerException("Null client");
-      }
-      this.client = client;
-      return this;
     }
 
     /** Configure debug logging mechanism. By default, nothing is logged. */
@@ -248,15 +237,6 @@ public class Analytics implements Closeable {
       return this;
     }
 
-    /** Set the {@link ExecutorService} on which all HTTP requests will be made. */
-    public Builder networkExecutor(ExecutorService networkExecutor) {
-      if (networkExecutor == null) {
-        throw new NullPointerException("Null networkExecutor");
-      }
-      this.networkExecutor = networkExecutor;
-      return this;
-    }
-
     /** Set the {@link ThreadFactory} used to create threads. */
     @Beta
     public Builder threadFactory(ThreadFactory threadFactory) {
@@ -329,14 +309,8 @@ public class Analytics implements Closeable {
       } else {
         messageInterceptors = Collections.unmodifiableList(messageInterceptors);
       }
-      if (networkExecutor == null) {
-        networkExecutor = Config.defaultNetworkExecutor();
-      }
       if (threadFactory == null) {
         threadFactory = Config.defaultThreadFactory();
-      }
-      if (client == null) {
-	client = Config.defaultClient();
       }
       if(httpConfig == null) {
 	  httpConfig = HttpConfig.builder().build();
@@ -357,7 +331,7 @@ public class Analytics implements Closeable {
       interceptor.setLevel(HttpLoggingInterceptor.Level.BASIC);
 
       OkHttpClient.Builder builder =
-          client
+          httpConfig.client
               .newBuilder()
               .addInterceptor(new AnalyticsRequestInterceptor(userAgent))
               .addInterceptor(interceptor);
@@ -372,18 +346,18 @@ public class Analytics implements Closeable {
         builder = builder.connectionSpecs(Arrays.asList(connectionSpec));
       }
 
-      client = builder.build();
+      httpConfig.client = builder.build();
 
       Retrofit restAdapter =
           new Retrofit.Builder()
               .addConverterFactory(GsonConverterFactory.create(gson))
               .baseUrl(DEFAULT_ENDPOINT)
-              .client(client)
+              .client(httpConfig.client)
               .build();
 
       SegmentService segmentService = restAdapter.create(SegmentService.class);
 
-      AnalyticsClient analyticsClient = new AnalyticsClient(endpoint, segmentService, log, threadFactory, networkExecutor, writeKey, gson, httpConfig, fileConfig);
+      AnalyticsClient analyticsClient = new AnalyticsClient(endpoint, segmentService, log, threadFactory,  writeKey, gson, httpConfig, fileConfig);
       return new Analytics(analyticsClient, messageTransformers, messageInterceptors, log);
     }
   }
