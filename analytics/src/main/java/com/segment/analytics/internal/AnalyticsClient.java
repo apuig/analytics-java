@@ -327,18 +327,22 @@ public class AnalyticsClient implements Closeable {
 
     @Override
     public void run() {
-      if (upload(() -> service.upload(uploadUrl, RequestBody.create(path.toFile(), JSON)).execute())) {
-	try {
-	  Files.delete(path);
-	} catch (IOException e) {
-	  // will attempt to submit again (rename file?)
-	  LOGGER.log(Level.WARNING, "Cannot delete file " + path, e);
-	}
+      try {
+        if(Files.lines(path).map(batchLine -> upload(() -> service.upload(uploadUrl, RequestBody.create(batchLine, JSON)).execute())).allMatch(Boolean.TRUE::equals)) {
+          try {
+            Files.delete(path);
+          } catch (IOException e) {
+            // will attempt to submit again (rename file?)
+            LOGGER.log(Level.WARNING, "Cannot delete file " + path, e);
+          }
+        }
+      } catch (IOException e) {
+        LOGGER.log(Level.WARNING, "Cannot process file " + path, e);
       }
     }
   }
 
-  public void resubmit(Path path) {
+  public void resubmit(Path path) throws IOException {
     networkExecutor.submit(new UploadFileTask(breaker, service, uploadUrl, path));
   }
 

@@ -31,7 +31,9 @@ public class Config {
     public static final int DEFAULT_FALLBACK_QUEUE_FLUSH_SIZE = 50;
     public static final int DEFAULT_FALLBACK_QUEUE_FLUSH_MS = 2_000;
     public static final int DEFAULT_FALLBACK_ROLLOVER_TIMEOUT_SECONDS = 60;
+    public static final int DEFAULT_FALLBACK_ROLLOVER_MAX_SIZE = 1024 * 1024 * 5;
     public static final String DEFAULT_FALLBACK_FILE = "pending";
+
 
     public static ThreadFactory defaultThreadFactory() {
         return new ThreadFactory() {
@@ -184,6 +186,8 @@ public class Config {
         final String filePath;
         /** max time to keep a open overflow file before finish the batch */
         final int rolloverTimeoutSeconds;
+        /** max size of files */
+        final long rolloverMaxSizeBytes;
 
         private FileConfig(Builder builder) {
             this.size = builder.size;
@@ -191,6 +195,7 @@ public class Config {
             this.flushMs = builder.flushMs;
             this.filePath = builder.filePath;
             this.rolloverTimeoutSeconds = builder.rolloverTimeoutSeconds;
+            this.rolloverMaxSizeBytes = builder.rolloverMaxSizeBytes;
         }
 
         public static Builder builder() {
@@ -203,6 +208,7 @@ public class Config {
             private int flushMs = DEFAULT_FALLBACK_QUEUE_FLUSH_MS;
             private String filePath = DEFAULT_FALLBACK_FILE;
             private int rolloverTimeoutSeconds = DEFAULT_FALLBACK_ROLLOVER_TIMEOUT_SECONDS;
+            private long rolloverMaxSizeBytes = DEFAULT_FALLBACK_ROLLOVER_MAX_SIZE;
 
             public Builder size(int value) {
                 this.size = value;
@@ -226,6 +232,11 @@ public class Config {
 
             public Builder rolloverTimeoutSeconds(int value) {
                 this.rolloverTimeoutSeconds = value;
+                return this;
+            }
+
+            public Builder rolloverMaxSizeBytes(long value) {
+                this.rolloverMaxSizeBytes = value;
                 return this;
             }
 
