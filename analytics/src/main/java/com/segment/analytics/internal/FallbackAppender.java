@@ -18,13 +18,14 @@ import java.nio.file.StandardOpenOption;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -41,8 +42,14 @@ public class FallbackAppender implements Closeable {
      */
     private static final long MAX_BATCH_SIZE = 475_000; // 475KB.
 
-    private Path currentFile;
-    private Instant currentStart;
+    private Path currentFileOverflow;
+    private Instant currentStartOverflow;
+    private Path currentFileBatch;
+    private Instant currentStartBatch;
+    private Lock currentFileBatchLock = new ReentrantLock();
+    private long currentLineSize = 0;
+    boolean firstEventInBatch = true;
+
     private final Path directory;
     private final Gson gson;
     private final FileConfig config;
@@ -57,7 +64,8 @@ public class FallbackAppender implements Closeable {
         this.config = config;
         this.directory = Files.createDirectories(Path.of(config.filePath));
 
-        rollover();
+        rolloverOverflow();
+        rolloverBatch();
 
         this.queue = new ArrayBlockingQueue<Message>(config.size);
         this.writer = threadFactory.newThread(new FileWriter());
@@ -66,24 +74,53 @@ public class FallbackAppender implements Closeable {
     }
 
     /** Ends the currentFile and start a new one */
-    private void rollover() {
+    private void rolloverOverflow() {
         String fileName;
-        if (currentFile != null) {
-            fileName = currentFile.getFileName().toString();
+        if (currentFileOverflow != null) {
+            fileName = currentFileOverflow.getFileName().toString();
             try {
                 Files.move(
-                        currentFile,
-                        currentFile.resolveSibling(fileName.substring(0, fileName.length() - TMP_EXTENSION.length())),
+                        currentFileOverflow,
+                        currentFileOverflow.resolveSibling(
+                                fileName.substring(0, fileName.length() - TMP_EXTENSION.length())),
                         StandardCopyOption.ATOMIC_MOVE);
             } catch (IOException e) {
                 LOGGER.log(Level.WARNING, "Cannot rollover " + fileName, e);
             }
         }
 
-        currentStart = Instant.now();
-        fileName = String.format("%s-%s%s", currentStart.toEpochMilli(), UUID.randomUUID(), TMP_EXTENSION);
-        this.currentFile = directory.resolve(fileName);
-        LOGGER.log(Level.FINE, "currentFile : {0}", fileName);
+        currentStartOverflow = Instant.now();
+        fileName = String.format("%s-%s%s", currentStartOverflow.toEpochMilli(), UUID.randomUUID(), TMP_EXTENSION);
+        this.currentFileOverflow = directory.resolve(fileName);
+        LOGGER.log(Level.FINE, "currentFileOverflow : {0}", fileName);
+        firstEventInBatch = true;
+    }
+
+    private void rolloverBatch() {
+        currentFileBatchLock.lock();
+        try {
+
+            String fileName;
+            if (currentFileBatch != null) {
+                fileName = currentFileBatch.getFileName().toString();
+                try {
+                    Files.move(
+                            currentFileBatch,
+                            currentFileBatch.resolveSibling(
+                                    fileName.substring(0, fileName.length() - TMP_EXTENSION.length())),
+                            StandardCopyOption.ATOMIC_MOVE);
+                } catch (IOException e) {
+                    LOGGER.log(Level.WARNING, "Cannot rollover " + fileName, e);
+                }
+            }
+
+            currentStartBatch = Instant.now();
+            fileName = String.format("%s-%s%s", currentStartBatch.toEpochMilli(), UUID.randomUUID(), TMP_EXTENSION);
+            this.currentFileBatch = directory.resolve(fileName);
+            LOGGER.log(Level.FINE, "currentFileBatch : {0}", fileName);
+        } finally {
+            currentFileBatchLock.unlock();
+        }
     }
 
     @Override
@@ -93,24 +130,25 @@ public class FallbackAppender implements Closeable {
 
     /** Write a new file with the content of a batch */
     public void add(Batch batch) {
-        String fileName = String.format("%s-%s", batch.sentAt().getTime(), UUID.randomUUID());
-        Path path = directory.resolve(fileName + TMP_EXTENSION);
-
+        currentFileBatchLock.lock();
         try (FileChannel fileChannel = FileChannel.open(
-                        path, StandardOpenOption.WRITE, StandardOpenOption.APPEND, StandardOpenOption.CREATE_NEW);
+                        currentFileBatch,
+                        StandardOpenOption.WRITE,
+                        StandardOpenOption.APPEND,
+                        StandardOpenOption.CREATE);
                 Writer w = Channels.newWriter(fileChannel, StandardCharsets.UTF_8)) {
 
             saveBatch(batch, w);
-
+            if (fileChannel.size() > config.rolloverMaxSizeBytes) {
+                rolloverBatch();
+            } else {
+                w.write(System.lineSeparator());
+            }
             // TODO fileChannel.force(true);
         } catch (IOException e) {
-            LOGGER.log(Level.WARNING, "Cannot write file batch file " + fileName, e);
-        }
-
-        try {
-            Files.move(path, path.resolveSibling(fileName), StandardCopyOption.ATOMIC_MOVE);
-        } catch (IOException e) {
-            LOGGER.log(Level.WARNING, "Cannot move file batch file " + fileName, e);
+            LOGGER.log(Level.WARNING, "Cannot write file batch file " + currentFileBatch, e);
+        } finally {
+            currentFileBatchLock.unlock();
         }
     }
 
@@ -136,10 +174,17 @@ public class FallbackAppender implements Closeable {
             while (!Thread.currentThread().isInterrupted()) {
                 try {
 
-                    if (Duration.between(currentStart, Instant.now()).getSeconds() > config.rolloverTimeoutSeconds
-                            && currentFile.toFile().exists()) {
-                        endCurrentFile();
-                        rollover();
+                    if ((Duration.between(currentStartOverflow, Instant.now()).getSeconds()
+                                            > config.rolloverTimeoutSeconds
+                                    && currentFileOverflow.toFile().exists())
+                            || currentFileOverflow.toFile().length() > config.rolloverMaxSizeBytes) {
+                        endCurrentLine();
+                        rolloverOverflow();
+                    }
+
+                    if (Duration.between(currentStartBatch, Instant.now()).getSeconds() > config.rolloverTimeoutSeconds
+                            && currentFileBatch.toFile().exists()) {
+                        rolloverBatch();
                     }
 
                     final Message msg = queue.poll(config.flushMs, TimeUnit.MILLISECONDS);
@@ -165,66 +210,68 @@ public class FallbackAppender implements Closeable {
 
     private static final byte[] BATCH_BEGIN = "{\"batch\":[".getBytes(StandardCharsets.UTF_8);
     private static final byte[] COMMA = ",".getBytes(StandardCharsets.UTF_8);
+    private static final byte[] NEW_LINE = System.lineSeparator().getBytes(StandardCharsets.UTF_8);
     private static final byte[] BATCH_END =
             "],\"sentAt\":\"2023-04-19T04:03:46.880Z\",\"writeKey\":\"mywrite\"}".getBytes(StandardCharsets.UTF_8);
     // FIXME DateTimeUtils
     // FIXME mywrite
 
     private void write(List<Message> batch) {
-        List<Message> remaining = writeInternal(batch);
-        while (!remaining.isEmpty()) {
-            rollover();
-            remaining = writeInternal(remaining);
-        }
-
+        writeInternal(batch);
         batch.clear();
     }
 
-    /** @return messages that do not fit in the current file */
-    private List<Message> writeInternal(List<Message> batch) {
+    private void writeInternal(List<Message> batch) {
         try (FileChannel fileChannel = FileChannel.open(
-                        currentFile, StandardOpenOption.WRITE, StandardOpenOption.APPEND, StandardOpenOption.CREATE);
+                        currentFileOverflow,
+                        StandardOpenOption.WRITE,
+                        StandardOpenOption.APPEND,
+                        StandardOpenOption.CREATE);
                 OutputStream os = Channels.newOutputStream(fileChannel)) {
 
-            long currentFileSize = fileChannel.size();
-            boolean first = currentFileSize == 0;
-            if (first) {
+            if (firstEventInBatch) {
                 os.write(BATCH_BEGIN);
+                currentLineSize = BATCH_BEGIN.length;
             }
 
             for (int i = 0; i < batch.size(); i++) {
                 Message msg = batch.get(i);
                 byte[] msgBytes = toJson(msg).getBytes(StandardCharsets.UTF_8);
-                if (msgBytes.length + currentFileSize + COMMA.length + BATCH_END.length > MAX_BATCH_SIZE) {
+                if (msgBytes.length + currentLineSize + COMMA.length + BATCH_END.length > MAX_BATCH_SIZE) {
                     os.write(BATCH_END);
-                    // TODO fileChannel.force(true);
-
-                    return batch.subList(i, batch.size());
+                    os.write(NEW_LINE);
+                    os.write(BATCH_BEGIN);
+                    currentLineSize = BATCH_BEGIN.length;
+                    firstEventInBatch = true;
                 }
 
-                if (first) {
-                    first = false;
+                if (firstEventInBatch) {
+                    firstEventInBatch = false;
                 } else {
                     os.write(COMMA);
+                    currentLineSize += COMMA.length;
                 }
                 os.write(msgBytes);
+                currentLineSize += msgBytes.length;
             }
             // TODO fileChannel.force(true);
-            return Collections.emptyList();
         } catch (IOException e) {
-            LOGGER.log(Level.WARNING, "write file " + currentFile, e);
-            return Collections.emptyList();
+            LOGGER.log(Level.WARNING, "write file " + currentFileOverflow, e);
         }
     }
 
-    private void endCurrentFile() {
-        try (FileChannel fileChannel = FileChannel.open(
-                        currentFile, StandardOpenOption.WRITE, StandardOpenOption.APPEND, StandardOpenOption.CREATE);
+    private void endCurrentLine() {
+        try (FileChannel fileChannel =
+                        FileChannel.open(currentFileOverflow, StandardOpenOption.WRITE, StandardOpenOption.APPEND);
                 OutputStream os = Channels.newOutputStream(fileChannel)) {
-            os.write(BATCH_END);
+            if (currentLineSize == BATCH_BEGIN.length) {
+                fileChannel.truncate(fileChannel.size() - (BATCH_BEGIN.length + NEW_LINE.length));
+            } else {
+                os.write(BATCH_END);
+            }
             // TODO fileChannel.force(true);
         } catch (IOException e) {
-            LOGGER.log(Level.WARNING, "write file " + currentFile, e);
+            LOGGER.log(Level.WARNING, "write file " + currentFileOverflow, e);
         }
     }
 
