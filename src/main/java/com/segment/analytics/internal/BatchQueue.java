@@ -110,7 +110,7 @@ public class BatchQueue implements Runnable, Closeable {
                     // messages.size() = number of additional commas
                     if (batchSize + message.size + messages.size() <= Constants.MAX_BATCH_SIZE) {
                         if (messages.isEmpty()) {
-                            firstMessageTime = System.currentTimeMillis();
+                            firstMessageTime = message.message.getTimestamp().toEpochMilli();
                         }
                         messages.add(message);
                         batchSize += message.size;
@@ -136,6 +136,7 @@ public class BatchQueue implements Runnable, Closeable {
                     if (sizeOverflow) {
                         messages.add(message);
                         batchSize += message.size;
+                        firstMessageTime = message.message.getTimestamp().toEpochMilli();
                         sizeOverflow = false;
                     }
                 }

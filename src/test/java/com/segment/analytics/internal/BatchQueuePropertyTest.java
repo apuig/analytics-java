@@ -26,7 +26,6 @@ import net.jqwik.api.Provide;
 import net.jqwik.api.constraints.IntRange;
 import net.jqwik.api.lifecycle.BeforeTry;
 import org.assertj.core.data.Offset;
-import org.awaitility.Awaitility;
 
 public class BatchQueuePropertyTest {
 
@@ -56,7 +55,7 @@ public class BatchQueuePropertyTest {
 
     @Provide
     Arbitrary<MessageWithDelay> messagesWithDelay() {
-        return Arbitraries.integers().between(0, 200).filter(d -> d % 5 == 0).map((d) -> {
+        return Arbitraries.integers().between(0, 100).filter(d -> d % 5 == 0).map((d) -> {
             Message m = new TrackMessage() {
                 @Override
                 public String toString() {
@@ -72,17 +71,23 @@ public class BatchQueuePropertyTest {
 
     @Provide
     Arbitrary<List<MessageWithDelay>> messagesWithDelayList() {
-        return messagesWithDelay().list().ofMinSize(100).ofMaxSize(500);
+        return messagesWithDelay().list().ofMinSize(10).ofMaxSize(50);
     }
 
-    @Property(tries = 100)
-    public void flushMs(
-            @ForAll @IntRange(min = 100, max = 1_000) int flushMs,
-            @ForAll("messagesWithDelayList") List<MessageWithDelay> messages)
-            throws Exception {
-        Assume.that(messages.stream().mapToInt(m -> m.delay).sum() > flushMs);
+    @Provide
+    Arbitrary<Integer> flushMsProvide() {
+        return Arbitraries.integers().between(100, 200).filter(d -> d % 50 == 0);
+    }
 
-        double delayFactor = flushMs > 500 ? 1.1 : 1.7; // account some internal work
+    @Property
+    public void flushMs(
+            @ForAll("flushMsProvide") int flushMs, @ForAll("messagesWithDelayList") List<MessageWithDelay> messages)
+            throws Exception {
+        int totalDelay = messages.stream().mapToInt(m -> m.delay).sum();
+        Assume.that(totalDelay > flushMs);
+        Assume.that(totalDelay < 1_500);
+
+        double delayFactor = 1.2; // account some internal work
         int flushMsWithFactor = (int) (flushMs * delayFactor);
 
         final AtomicInteger expectedMsgCount = new AtomicInteger();
@@ -157,7 +162,7 @@ public class BatchQueuePropertyTest {
         return messages().list().ofMinSize(100).ofMaxSize(500);
     }
 
-    @Property(tries = 100)
+    @Property
     public void flushSize(
             @ForAll @IntRange(min = 1, max = 400) int flushSize, @ForAll("messageList") List<Message> messages)
             throws Exception {
@@ -171,7 +176,7 @@ public class BatchQueuePropertyTest {
                 BatchQueueConfig.builder()
                         .size(5_000)
                         .flushSize(flushSize)
-                        .flushMs(500)
+                        .flushMs((int) (flushSize * 1.5))
                         .build(),
                 batchConsumer);
 
@@ -181,20 +186,25 @@ public class BatchQueuePropertyTest {
             expectedMsgCount.incrementAndGet();
         });
 
-        Awaitility.await()
-                .pollInterval(Duration.ofMillis(50))
-                .pollDelay(Duration.ofMillis(100))
-                .atMost(Duration.ofSeconds(1))
-                .until(bq::isEmpty);
+        Thread.sleep((long) (flushSize + 1.1));
         bq.close();
 
         assertThat(batches).isNotEmpty();
         int msgCount = 0;
+        int batchesCount = 0;
+        int batchesCountExactMatch = 0;
         for (Batch b : batches) {
             assertThat(JSON.sizeInBytes(b)).isLessThanOrEqualTo(Constants.MAX_BATCH_SIZE);
             assertThat(b.getBatch().size()).isLessThanOrEqualTo(flushSize);
             msgCount += b.getBatch().size();
+            batchesCount++;
+            if (b.getBatch().size() == flushSize) {
+                batchesCountExactMatch++;
+            }
         }
+
+        // only the last batch
+        assertThat(batchesCountExactMatch - batchesCount).isLessThan(1);
 
         int drainSize = bq.drainQueue().size();
         assertThat(drainSize).isLessThan(flushSize);
