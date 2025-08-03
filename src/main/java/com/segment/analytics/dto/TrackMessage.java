@@ -1,6 +1,7 @@
 package com.segment.analytics.dto;
 
 import java.util.Map;
+import java.util.UUID;
 
 /**
  * The track API call is how you record any actions your users perform, along with any properties that describe the action.
@@ -15,6 +16,13 @@ public class TrackMessage extends Message {
     public TrackMessage() {
         super();
         setType(Type.track);
+    }
+
+    public TrackMessage(String userId, String event) {
+        this();
+        setUserId(userId);
+        setEvent(event);
+        setMessageId(UUID.randomUUID().toString());
     }
 
     public String getEvent() {

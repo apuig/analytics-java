@@ -4,7 +4,7 @@ public class StorageConfig extends BatchQueueConfig {
     /** path to save pending messages */
     public final String filePath;
 
-    private StorageConfig(Builder builder) {
+    private StorageConfig(final Builder builder) {
         super(builder);
         this.filePath = builder.filePath;
     }
@@ -13,21 +13,27 @@ public class StorageConfig extends BatchQueueConfig {
         return new Builder();
     }
 
-    public static class Builder extends BatchQueueConfig.Builder {
+    public static final class Builder extends BatchQueueConfig.Builder<Builder> {
         private String filePath = Defaults.DEFAULT_STORAGE_FILE;
 
-        Builder() {
+        public Builder() {
             this.size = Defaults.DEFAULT_STORAGE_QUEUE_SIZE;
             this.flushMs = Defaults.DEFAULT_STORAGE_QUEUE_FLUSH_MS;
         }
 
-        public Builder filePath(String value) {
+        public Builder filePath(final String value) {
             this.filePath = value;
             return this;
         }
 
+        @Override
         public StorageConfig build() {
             return new StorageConfig(this);
+        }
+
+        @Override
+        protected Builder self() {
+            return this;
         }
     }
 }

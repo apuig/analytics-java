@@ -20,7 +20,7 @@ public class JSONTest {
         batch.getBatch().add(new IdentifyMessage());
         batch.getBatch().add(new TrackMessage());
 
-        Batch batchBack = JSON.OBJECT_MAPPER.readValue(JSON.toJson(batch), Batch.class);
+        Batch batchBack = JSON.objectMapper.readValue(JSON.toJson(batch), Batch.class);
 
         assertThat(batchBack.getBatch()).hasSize(2);
         assertThat(batchBack.getBatch().get(0)).isInstanceOf(IdentifyMessage.class);
@@ -34,7 +34,7 @@ public class JSONTest {
         // segment expects millisecond resolution
         Instant withMillis = batch.getSentAt().truncatedTo(ChronoUnit.MILLIS);
 
-        Batch batchBack = JSON.OBJECT_MAPPER.readValue(JSON.toJson(batch), Batch.class);
+        Batch batchBack = JSON.objectMapper.readValue(JSON.toJson(batch), Batch.class);
         assertThat(batchBack.getSentAt()).isEqualTo(withMillis);
     }
 }

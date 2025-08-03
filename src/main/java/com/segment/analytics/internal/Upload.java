@@ -1,12 +1,12 @@
 package com.segment.analytics.internal;
 
-import com.segment.analytics.config.Constants;
-import com.segment.analytics.config.Defaults;
-import com.segment.analytics.config.HttpConfig;
-import com.segment.analytics.dto.Batch;
-import dev.failsafe.CircuitBreaker;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.Closeable;
 import java.io.FileNotFoundException;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.UncheckedIOException;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpClient.Redirect;
@@ -28,6 +28,14 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import java.util.zip.GZIPOutputStream;
+
+import com.segment.analytics.config.Constants;
+import com.segment.analytics.config.Defaults;
+import com.segment.analytics.config.HttpConfig;
+import com.segment.analytics.dto.Batch;
+
+import dev.failsafe.CircuitBreaker;
 /**
  * Perform HTTP upload of {@link Batch}, keeps a circuit-breaker in order to fail fast.
  * */
@@ -39,6 +47,7 @@ public class Upload implements Closeable {
     private final CircuitBreaker<?> breaker;
     private final ExecutorService networkExecutor;
     private final Consumer<Batch> retryUpload;
+    private final boolean useGzip;
 
     public Upload(HttpConfig config, URI uri, Consumer<Batch> retryUpload) {
         this.retryUpload = retryUpload;
@@ -71,11 +80,12 @@ public class Upload implements Closeable {
                     }
                 },
                 new CallerRunsPolicy() {
+                    @Override
                     public void rejectedExecution(Runnable r, ThreadPoolExecutor e) {
                         LOGGER.log(
                                 Level.FINEST,
-                                "networkPool exhausted, running in {0}",
-                                Thread.currentThread().getName());
+                                () -> "networkPool exhausted, running in "
+                                        + Thread.currentThread().getName());
                         super.rejectedExecution(r, e);
                     }
                 });
@@ -92,16 +102,36 @@ public class Upload implements Closeable {
         if (config.gzip) {
             requestBuilder.header("Content-Encoding", "gzip");
         }
+        this.useGzip = config.gzip;
     }
 
     public void upload(Batch batch) {
+        byte[] payload = JSON.toJson(batch);
+        BodyPublisher publisher;
+        if (useGzip) {
+            publisher = BodyPublishers.ofInputStream(() -> gzipStream(payload));
+        } else {
+            publisher = BodyPublishers.ofByteArray(payload);
+        }
         networkExecutor.submit(new UploadTask(
                 breaker,
                 client,
                 requestBuilder,
-                BodyPublishers.ofByteArray(JSON.toJson(batch)),
+                publisher,
                 () -> {}, // no-retry
                 () -> retryUpload.accept(batch)));
+    }
+
+    private static InputStream gzipStream(byte[] input) {
+        try {
+            ByteArrayOutputStream bos = new ByteArrayOutputStream();
+            try (GZIPOutputStream gzip = new GZIPOutputStream(bos)) {
+                gzip.write(input);
+            }
+            return new ByteArrayInputStream(bos.toByteArray());
+        } catch (IOException e) {
+            throw new UncheckedIOException("Failed to gzip payload", e);
+        }
     }
 
     public void retry(Path tmpFile, Consumer<Path> noRetry, Consumer<Path> retry) {
@@ -115,7 +145,7 @@ public class Upload implements Closeable {
                     () -> retry.accept(tmpFile)));
         } catch (FileNotFoundException e) {
             // Concurrent removed, all ok
-            LOGGER.log(Level.FINE, "already removed {0}", tmpFile);
+            LOGGER.log(Level.FINE, () -> "already removed " + tmpFile);
         }
     }
 
@@ -152,7 +182,7 @@ public class Upload implements Closeable {
 
                     int statusCode = response.statusCode();
                     if (statusCode >= 300) {
-                        LOGGER.log(Level.WARNING, "upload {0} - {1}", new Object[] {statusCode, response.body()});
+                        LOGGER.log(Level.WARNING, () -> "upload %d - %s".formatted(statusCode, response.body()));
                         if (statusCode == 429) {
                             LOGGER.log(Level.SEVERE, "rate limit reached");
                             breaker.open();
@@ -170,6 +200,9 @@ public class Upload implements Closeable {
                         needsRetry = false;
                     }
 
+                } catch (InterruptedException e) {
+                    LOGGER.log(Level.WARNING, "interrupted", e);
+                    Thread.currentThread().interrupt();
                 } catch (Exception e) {
                     LOGGER.log(Level.WARNING, "upload", e);
                     breaker.recordException(e);

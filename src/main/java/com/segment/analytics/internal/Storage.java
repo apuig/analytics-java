@@ -68,7 +68,7 @@ public class Storage {
 
             tryMoveToSibling(path, fileName);
         } catch (IOException e) {
-            LOGGER.log(Level.WARNING, "Cannot write batch file " + path, e);
+            LOGGER.log(Level.WARNING, e, () -> "Cannot write batch file " + path);
         }
     }
 
@@ -78,15 +78,12 @@ public class Storage {
         long now = System.currentTimeMillis();
         try (DirectoryStream<Path> files = Files.newDirectoryStream(folder)) {
             for (Path file : files) {
-                if (!Files.isRegularFile(file)) {
-                    continue;
-                }
                 String fileName = file.getFileName().toString();
-                if (fileName.endsWith(TMP_EXTENSION)) {
+                if (!Files.isRegularFile(file) || fileName.endsWith(TMP_EXTENSION)) {
                     continue;
                 }
                 long retryAfter = retryAfter(fileName);
-                if (retryAfter != -1 & now >= retryAfter) {
+                if (retryAfter != -1 && now >= retryAfter) {
                     queue.offer(new FileEntry(file, retryAfter));
                     count++;
                     if (count >= max) {
@@ -95,7 +92,7 @@ public class Storage {
                 }
             }
         } catch (IOException e) {
-            LOGGER.log(Level.WARNING, "Cannot list directory " + folder, e);
+            LOGGER.log(Level.WARNING, e, () -> "Cannot list directory " + folder);
         }
         return queue;
     }
@@ -104,7 +101,7 @@ public class Storage {
         try {
             Files.delete(file);
         } catch (IOException e) {
-            LOGGER.log(Level.WARNING, "Failed to delete " + file, e);
+            LOGGER.log(Level.WARNING, e, () -> "Failed to delete " + file);
         }
     }
 
@@ -134,7 +131,7 @@ public class Storage {
 
         if (nextRetry >= retryAt.size()) {
             tryDelete(tmpFile);
-            LOGGER.log(Level.WARNING, "Expired file {0}", fileName);
+            LOGGER.log(Level.WARNING, () -> "Expired file " + tmpFile);
             return;
         }
 
@@ -142,19 +139,18 @@ public class Storage {
         String newName = formatFileName(createdAt, retryAfter, nextRetry, uuid);
 
         if (tryMoveToSibling(tmpFile, newName) == null) {
-            LOGGER.log(Level.WARNING, "Failed to reschedule " + tmpFile);
+            LOGGER.log(Level.WARNING, () -> "Failed to reschedule " + tmpFile);
         }
     }
 
     private Path tryMoveToSibling(Path file, String newFileName) {
         Path newFile = file.resolveSibling(newFileName);
         try {
-            Files.move(file, newFile, StandardCopyOption.ATOMIC_MOVE);
+            return Files.move(file, newFile, StandardCopyOption.ATOMIC_MOVE);
         } catch (IOException e) {
-            LOGGER.log(Level.FINER, "Cannot move batch file " + file + " , keeping it", e);
+            LOGGER.log(Level.FINER, e, () -> "Cannot move batch file " + file + " , keeping it");
             return null;
         }
-        return newFile;
     }
 
     private long retryAfter(String fileName) {

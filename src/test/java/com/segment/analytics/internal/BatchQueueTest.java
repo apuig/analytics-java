@@ -15,7 +15,11 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 import org.assertj.core.data.Offset;
 import org.awaitility.Awaitility;
@@ -80,6 +84,10 @@ public class BatchQueueTest {
                     .minus(Duration.ofMillis(flushSize))
                     .toMillis();
             assertThat(additionalMs).isCloseTo(0l, Offset.offset(100l));
+            // Also check batch context propagation
+            assertThat(batch.getContext()).isEqualTo(CONTEXT);
+            // Also check batch writeKey propagation
+            assertThat(batch.getWriteKey()).isEqualTo(WK);
         }
     }
 
@@ -120,6 +128,10 @@ public class BatchQueueTest {
             int batchSize =
                     assertThat(batches).singleElement().actual().getBatch().size();
             assertThat(batchSize).isEqualTo(flushSize);
+            // Also check batch context propagation
+            Batch batch = assertThat(batches).singleElement().actual();
+            assertThat(batch.getContext()).isEqualTo(CONTEXT);
+            assertThat(batch.getWriteKey()).isEqualTo(WK);
         }
     }
 
@@ -213,6 +225,172 @@ public class BatchQueueTest {
             assertThat(bq.drainQueue())
                     .singleElement()
                     .matches(mws -> Objects.equals(mws.message.getMessageId(), msg.getMessageId()));
+            // Also check that drainQueue returns empty after draining
+            assertThat(bq.drainQueue()).isEmpty();
+        }
+    }
+
+    @Test
+    public void offerNonBlocking() throws Throwable {
+        // Given a small queue size and not starting the consumer
+        int size = 2;
+        try (BatchQueue bq = new BatchQueue(
+                Defaults.defaultThreadFactory(),
+                WK,
+                CONTEXT,
+                BatchQueueConfig.builder()
+                        .size(size)
+                        .flushSize(size)
+                        .flushMs(10000)
+                        .build(),
+                batchConsumer,
+                false)) {
+
+            // When offering messages up to capacity
+            for (int i = 0; i < size; i++) {
+                assertThat(bq.offer(createIdentifyMessage())).isTrue();
+            }
+            // Then offering one more, should return false
+            assertThat(bq.offer(createIdentifyMessage())).isFalse();
+        }
+    }
+
+    @Test
+    public void putBlocksWhenFull() throws Throwable {
+        // Given a queue size of 1 and and not starting the consumer
+        int size = 1;
+        try (BatchQueue bq = new BatchQueue(
+                Defaults.defaultThreadFactory(),
+                WK,
+                CONTEXT,
+                BatchQueueConfig.builder()
+                        .size(size)
+                        .flushSize(size + 10)
+                        .flushMs(Integer.MAX_VALUE)
+                        .build(),
+                batchConsumer,
+                false)) {
+            // and queue already contains 1 element
+            bq.put(createIdentifyMessage());
+            // When adding a new element
+            CountDownLatch latch = new CountDownLatch(1);
+            AtomicBoolean blocked = new AtomicBoolean(false);
+            Thread t = new Thread(() -> {
+                blocked.set(true);
+                bq.put(createIdentifyMessage());
+                latch.countDown();
+            });
+            t.start();
+            // And wait to ensure thread is blocked on put
+            Thread.sleep(500);
+            // Then the queue put operation is blocked
+            assertThat(blocked.get()).isTrue();
+            assertThat(latch.getCount()).isEqualTo(1);
+            bq.drainQueue();
+            latch.await(1, TimeUnit.SECONDS);
+            assertThat(latch.getCount()).isZero();
+        }
+    }
+
+    @Test
+    public void emptyQueueDrainReturnsEmpty() throws Throwable {
+        try (BatchQueue bq = new BatchQueue(
+                Defaults.defaultThreadFactory(),
+                WK,
+                CONTEXT,
+                BatchQueueConfig.builder().size(10).flushSize(10).flushMs(10000).build(),
+                batchConsumer)) {
+            assertThat(bq.drainQueue()).isEmpty();
+        }
+    }
+
+    @Test
+    public void concurrentPutAndBatching() throws Throwable {
+        int threadCount = 5;
+        int messagesPerThread = 10;
+        int totalMessages = threadCount * messagesPerThread;
+        try (BatchQueue bq = new BatchQueue(
+                Executors.defaultThreadFactory(),
+                WK,
+                CONTEXT,
+                BatchQueueConfig.builder()
+                        .size(totalMessages)
+                        .flushSize(totalMessages)
+                        .flushMs(10000)
+                        .build(),
+                batchConsumer)) {
+
+            List<Thread> threads = new ArrayList<>();
+            for (int i = 0; i < threadCount; i++) {
+                threads.add(new Thread(() -> {
+                    for (int j = 0; j < messagesPerThread; j++) {
+                        bq.put(createIdentifyMessage());
+                    }
+                }));
+            }
+            threads.forEach(Thread::start);
+            for (Thread t : threads) {
+                t.join();
+            }
+
+            Awaitility.await().atMost(Duration.ofSeconds(2)).until(() -> !batches.isEmpty());
+            Batch batch = assertThat(batches).singleElement().actual();
+            assertThat(batch.getBatch()).hasSize(totalMessages);
+        }
+    }
+
+    @Test
+    public void messageOrderingPreserved() throws Throwable {
+        int flushSize = 5;
+        List<String> ids = new ArrayList<>();
+        try (BatchQueue bq = new BatchQueue(
+                Defaults.defaultThreadFactory(),
+                WK,
+                CONTEXT,
+                BatchQueueConfig.builder()
+                        .size(flushSize)
+                        .flushSize(flushSize)
+                        .flushMs(10000)
+                        .build(),
+                batchConsumer)) {
+
+            for (int i = 0; i < flushSize; i++) {
+                Message m = createIdentifyMessage();
+                m.setMessageId("msg-" + i);
+                ids.add(m.getMessageId());
+                bq.put(m);
+            }
+            Awaitility.await().atMost(Duration.ofSeconds(1)).until(() -> !batches.isEmpty());
+            Batch batch = assertThat(batches).singleElement().actual();
+            List<String> batchIds =
+                    batch.getBatch().stream().map(Message::getMessageId).toList();
+            assertThat(batchIds).containsExactlyElementsOf(ids);
+        }
+    }
+
+    @Test
+    public void batchConsumerExceptionDoesNotCrashThread() throws Throwable {
+        AtomicInteger callCount = new AtomicInteger(0);
+        Consumer<Batch> faultyConsumer = b -> {
+            callCount.incrementAndGet();
+            throw new RuntimeException("fail");
+        };
+
+        try (BatchQueue bq = new BatchQueue(
+                Defaults.defaultThreadFactory(),
+                WK,
+                CONTEXT,
+                BatchQueueConfig.builder().size(10).flushSize(2).flushMs(10000).build(),
+                faultyConsumer)) {
+
+            bq.put(createIdentifyMessage());
+            bq.put(createIdentifyMessage());
+            Thread.sleep(200);
+            // Thread should still be alive and able to accept more messages
+            bq.put(createIdentifyMessage());
+            bq.put(createIdentifyMessage());
+            Thread.sleep(200);
+            assertThat(callCount.get()).isGreaterThanOrEqualTo(2);
         }
     }
 

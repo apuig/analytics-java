@@ -1,7 +1,13 @@
 package com.segment.analytics.internal;
 
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.io.Writer;
+import java.time.Instant;
+import java.time.format.DateTimeFormatter;
+import java.time.temporal.ChronoUnit;
+
 import com.fasterxml.jackson.annotation.JsonInclude.Include;
-import com.fasterxml.jackson.core.JacksonException;
 import com.fasterxml.jackson.core.JsonGenerator;
 import com.fasterxml.jackson.core.JsonParser;
 import com.fasterxml.jackson.databind.DeserializationContext;
@@ -10,14 +16,9 @@ import com.fasterxml.jackson.databind.SerializerProvider;
 import com.fasterxml.jackson.databind.deser.std.StdDeserializer;
 import com.fasterxml.jackson.databind.ser.std.StdSerializer;
 import com.segment.analytics.dto.Batch;
-import java.io.IOException;
-import java.io.Writer;
-import java.time.Instant;
-import java.time.format.DateTimeFormatter;
-import java.time.temporal.ChronoUnit;
 
 public final class JSON {
-    public static ObjectMapper OBJECT_MAPPER = new ObjectMapper().setDefaultPropertyInclusion(Include.NON_EMPTY);
+    public static final ObjectMapper objectMapper = new ObjectMapper().setDefaultPropertyInclusion(Include.NON_EMPTY);
 
     public static int sizeInBytes(Object obj) {
         return toJson(obj).length;
@@ -25,22 +26,22 @@ public final class JSON {
 
     public static byte[] toJson(final Object msg) {
         try {
-            return OBJECT_MAPPER.writeValueAsBytes(msg);
-        } catch (Exception e) {
-            throw new RuntimeException(e);
+            return objectMapper.writeValueAsBytes(msg);
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
         }
     }
 
     public static void write(final Batch batch, Writer file) {
         try {
-            OBJECT_MAPPER.writeValue(file, batch);
-        } catch (Exception e) {
-            throw new RuntimeException(e);
+            objectMapper.writeValue(file, batch);
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
         }
     }
 
     public static final class InstantSerializer extends StdSerializer<Instant> {
-        private static final long serialVersionUID = -2276445460014609308L;
+        private static final long serialVersionUID = 1L;
 
         protected InstantSerializer() {
             super(Instant.class);
@@ -53,14 +54,14 @@ public final class JSON {
     }
 
     public static final class InstantDeserializer extends StdDeserializer<Instant> {
-        private static final long serialVersionUID = -7976174277511994690L;
+        private static final long serialVersionUID = 1L;
 
         protected InstantDeserializer() {
             super(Instant.class);
         }
 
         @Override
-        public Instant deserialize(JsonParser p, DeserializationContext ctxt) throws IOException, JacksonException {
+        public Instant deserialize(JsonParser p, DeserializationContext ctxt) throws IOException {
             return Instant.from(DateTimeFormatter.ISO_INSTANT.parse(p.getText()));
         }
     }

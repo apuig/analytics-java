@@ -1,42 +1,26 @@
-# Why
+# Reliability Overview
 
-Provide a different reliability tradeoff 
-- `analytics-java`: is not durable at all, it can lose events if you don't implement the appropriate callbacks and retries
-- `analytics-kotlin`: on the opposite direction, writes every single message to disk before attempt to upload it
+This implementation provides a middle ground between `analytics-java` (not durable, may lose events) and `analytics-kotlin` (writes every message to disk before upload).
 
-This implementation only write to disk when
-- upload fail
-- too many messages waiting to be uploaded 
+**Key reliability features:**
+- Messages are written to disk only if upload fails or if too many messages are waiting to be uploaded.
+- Configurable, durable retry mechanism for failed uploads.
+- Circuit breaker for HTTP uploads to prevent repeated failures.
 
-It also provides
-- configurable and durable retry mechanism
-- circuit breaker on the HTTP upload
+## Reliability Tradeoffs During Ungraceful Shutdown
 
+- **Possible Event Loss:** Events may be lost if the process crashes while messages are:
+  - Waiting in memory to be uploaded (`http.size`)
+  - Waiting to be batched (`http.flushSize`, `http.flushMs`)
+  - In-flight in HTTP requests (`http.executorSize`)
+- For typical loads, events created within `http.flushMs` (default 10s) before a crash may be lost.
 
-# Edge cases
+## Back Pressure & Edge Cases
 
-### Ungraceful shutdown
-**It can lose events**
-- `http.size` messages waiting to be uploaded
-- `http.flushSize` messages waiting to create a batch
-- `http.flushMs` messages waiting to create a batch
-- `http.executorSize` in flight HTTP requests
+- If Segment API latency is high and concurrent uploads are limited, back pressure moves upload execution to internal threads.
+- If file system latency is also high, overflow queues block the calling code until batches can be written to disk.
 
-For a regular load it means it can lose events created `http.flushMs` (default 10s) before the crash
-
-> Please note `analytics-kotlin` also implements some flush mechanism, meaning it could also lost events
-
-### Segment API latency is high and the configured number of concurrent uploads cannot meet the request rate
-The back pressure will **move the upload execution** (CallerRun Policy on the networkExecutor) to this threads
-- Upload BatchQueue: meaning the consumption of pending to upload messages will be delayed
-- RetryUpload: meaning it will not retry more files until the upload pool have some slot 
-
-#### ... and file system latency is also high
-In this case we can overflow both BatchQueue.
-The overflow BatchQueue use `put`, so it will **block the calling code**, waiting to write some batch to disk
-
-
-# Overview
+## Architecture Overview
 
 ```mermaid
 sequenceDiagram
@@ -94,7 +78,6 @@ sequenceDiagram
     Storage->>-QueueStorage:     
     deactivate QueueStorage
 
-    
     loop scheduled check        
         activate Retry
         Retry->>+Storage: list files

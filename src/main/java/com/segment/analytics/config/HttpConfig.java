@@ -18,7 +18,7 @@ public class HttpConfig extends BatchQueueConfig {
     /** max number of HTTP upload requests waiting to be executed */
     public final int executorQueueSize;
 
-    private HttpConfig(Builder builder) {
+    private HttpConfig(final Builder builder) {
         super(builder);
         this.circuitErrorsInAMinute = builder.circuitErrorsInAMinute;
         this.circuitSecondsInOpen = builder.circuitSecondsInOpen;
@@ -34,7 +34,7 @@ public class HttpConfig extends BatchQueueConfig {
         return new Builder();
     }
 
-    public static class Builder extends BatchQueueConfig.Builder {
+    public static final class Builder extends BatchQueueConfig.Builder<Builder> {
         private int circuitErrorsInAMinute = Defaults.DEFAULT_HTTP_CIRCUIT_ERRORS_IN_A_MINUTE;
         private int circuitSecondsInOpen = Defaults.DEFAULT_HTTP_CIRCUIT_SECONDS_IN_OPEN;
         private int circuitRequestToClose = Defaults.DEFAULT_HTTP_CIRCUIT_REQUESTS_TO_CLOSE;
@@ -46,54 +46,60 @@ public class HttpConfig extends BatchQueueConfig {
 
         private boolean gzip;
 
-        Builder() {
+        public Builder() {
             this.size = Defaults.DEFAULT_HTTP_QUEUE_SIZE;
             this.flushSize = Defaults.DEFAULT_HTTP_QUEUE_FLUSH_SIZE;
             this.flushMs = Defaults.DEFAULT_HTTP_QUEUE_FLUSH_MS;
         }
 
-        public Builder circuitErrorsInAMinute(int value) {
+        public Builder circuitErrorsInAMinute(final int value) {
             this.circuitErrorsInAMinute = value;
             return this;
         }
 
-        public Builder circuitSecondsInOpen(int value) {
+        public Builder circuitSecondsInOpen(final int value) {
             this.circuitSecondsInOpen = value;
             return this;
         }
 
-        public Builder circuitRequestToClose(int value) {
+        public Builder circuitRequestToClose(final int value) {
             this.circuitRequestToClose = value;
             return this;
         }
 
-        public Builder executorSize(int value) {
+        public Builder executorSize(final int value) {
             this.executorSize = value;
             return this;
         }
 
-        public Builder executorQueueSize(int value) {
+        public Builder executorQueueSize(final int value) {
             this.executorQueueSize = value;
             return this;
         }
 
-        public Builder connectionTimeoutSeconds(int value) {
+        public Builder connectionTimeoutSeconds(final int value) {
             this.connectionTimeoutSeconds = value;
             return this;
         }
 
-        public Builder readTimeoutSeconds(int value) {
+        public Builder readTimeoutSeconds(final int value) {
             this.readTimeoutSeconds = value;
             return this;
         }
 
-        public Builder gzip(boolean value) {
+        public Builder gzip(final boolean value) {
             this.gzip = value;
             return this;
         }
 
+        @Override
         public HttpConfig build() {
             return new HttpConfig(this);
+        }
+
+        @Override
+        protected Builder self() {
+            return this;
         }
     }
 }

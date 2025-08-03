@@ -5,20 +5,15 @@ import static com.github.tomakehurst.wiremock.client.WireMock.post;
 import static com.github.tomakehurst.wiremock.client.WireMock.stubFor;
 import static com.github.tomakehurst.wiremock.client.WireMock.urlEqualTo;
 import static com.github.tomakehurst.wiremock.core.WireMockConfiguration.wireMockConfig;
+import static org.assertj.core.api.Assertions.assertThat;
 
-import com.github.tomakehurst.wiremock.client.WireMock;
-import com.github.tomakehurst.wiremock.junit.WireMockRule;
-import com.github.tomakehurst.wiremock.stubbing.ServeEvent;
-import com.segment.analytics.config.Defaults;
-import com.segment.analytics.config.HttpConfig;
-import com.segment.analytics.config.StorageConfig;
-import com.segment.analytics.dto.TrackMessage;
 import java.io.IOException;
-import java.net.MalformedURLException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.HashSet;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
@@ -27,7 +22,7 @@ import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.ThreadPoolExecutor.CallerRunsPolicy;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
-import org.apache.commons.io.FileUtils;
+
 import org.awaitility.Awaitility;
 import org.junit.After;
 import org.junit.Before;
@@ -35,6 +30,15 @@ import org.junit.Rule;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.JUnit4;
+
+import com.github.tomakehurst.wiremock.client.WireMock;
+import com.github.tomakehurst.wiremock.junit.WireMockRule;
+import com.github.tomakehurst.wiremock.stubbing.ServeEvent;
+import com.segment.analytics.config.HttpConfig;
+import com.segment.analytics.config.RetryConfig;
+import com.segment.analytics.config.StorageConfig;
+import com.segment.analytics.dto.TrackMessage;
+
 import wiremock.com.fasterxml.jackson.core.JsonProcessingException;
 import wiremock.com.fasterxml.jackson.databind.JsonNode;
 import wiremock.com.fasterxml.jackson.databind.ObjectMapper;
@@ -52,34 +56,46 @@ public class SegmentTest {
     static int numClients = 10;
     static int messageContentChars = 100;
     static int responseDelay = 100;
-    static final int durationInSeconds = 60;
+    static final int durationInSeconds = 30;
 
     static Duration duration = Duration.ofSeconds(durationInSeconds);
 
+    private Path tmpFolder;
+
     Analytics analytics;
 
-    public static void main(String[] args) throws MalformedURLException, IOException {
-        Analytics analytics = Analytics.builder("write-key")
-                .endpoint("http://localhost:8080")
-                .httpConfig(HttpConfig.builder()
-                        .build())
-                .storageConfig(StorageConfig.builder()
-                        .build())
-                .build();
-        TrackMessage msg = new TrackMessage();
-        msg.setEvent("my-track");
-        msg.setMessageId("a");
-        msg.setUserId("userId");
-
-        analytics.enqueue(msg);
-    }
-
     @Before
-    public void setup() throws IOException {
-        FileUtils.deleteDirectory(Path.of(Defaults.DEFAULT_STORAGE_FILE).toFile());
+    public void setup() throws Exception {
+        tmpFolder = Files.createTempDirectory("retryuploadtest");
 
         analytics = Analytics.builder("write-key")
                 .endpoint(wireMockRule.baseUrl())
+                // increase default flush size
+                .httpConfig(HttpConfig.builder()
+                        .size(1_000)
+                        .flushSize(200)
+                        .flushMs(5_000)
+                        // configure circuit to check often
+                        .circuitSecondsInOpen(10)
+                        .circuitErrorsInAMinute(2)
+                        .circuitRequestToClose(1)
+                        .build())
+                .storageConfig(StorageConfig.builder()
+                        .size(1_000)
+                        .flushSize(200)
+                        .flushMs(5_000)
+                        .filePath(tmpFolder.toString())
+                        .build())
+                .retryConfig(RetryConfig.builder()
+                        .retryAt(List.of(
+                                Duration.ofSeconds(1),
+                                Duration.ofSeconds(3),
+                                Duration.ofSeconds(5),
+                                Duration.ofSeconds(10),
+                                Duration.ofSeconds(15),
+                                Duration.ofSeconds(20),
+                                Duration.ofSeconds(30)))
+                        .build())
                 .build();
     }
 
@@ -109,7 +125,6 @@ public class SegmentTest {
         long start = System.currentTimeMillis();
 
         String content = RandomStringUtils.randomAlphanumeric(messageContentChars);
-        long lastActivity = System.currentTimeMillis();
 
         final AtomicInteger id = new AtomicInteger(0);
         ExecutorService exec = new ThreadPoolExecutor(
@@ -154,13 +169,17 @@ public class SegmentTest {
             throw new IllegalStateException("timeout waiting clients");
         }
 
-        int expectedEvents = id.get();
+        int expectedEvents = id.get(); // only sending track events
         Awaitility.await()
                 .atMost(durationInSeconds * 5, TimeUnit.SECONDS)
                 .pollInterval(5, TimeUnit.SECONDS)
-                .until(() -> checkSentMessages(expectedEvents));
+                .until(() -> checkEventCount(expectedEvents));
 
-        // FIXME assertThat(countEventFiles()).isZero();
+        assertThat(countEventFiles()).isZero();
+    }
+
+    private long countEventFiles() throws IOException {
+        return Files.list(tmpFolder).count();
     }
 
     void segmentHttpUp() {
@@ -178,10 +197,10 @@ public class SegmentTest {
 
     private static final ObjectMapper OM = new ObjectMapper();
 
-    private boolean checkSentMessages(int expected) {
+    private boolean checkEventCount(int expected) {
         int sentMessages = countSendMessages();
         System.err.println("Confirmed msgs %d / %d ".formatted(sentMessages, expected));
-        return sentMessages >= expected;
+        return sentMessages == expected;
     }
 
     private int countSendMessages() {

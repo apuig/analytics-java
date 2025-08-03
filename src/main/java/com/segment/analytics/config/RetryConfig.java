@@ -5,7 +5,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 
-public class RetryConfig {
+public final class RetryConfig {
     /** seconds to wait between executions */
     public final int delaySeconds;
     /** seconds to wait before the first executions */
@@ -13,32 +13,32 @@ public class RetryConfig {
     /** sequence of retry delays */
     public final List<Duration> retryAt;
 
-    private RetryConfig(Builder builder) {
+    private RetryConfig(final Builder builder) {
         this.delaySeconds = builder.delaySeconds;
         this.initialDelaySeconds = builder.initialDelaySeconds;
-        this.retryAt = builder.retryAt;
+        this.retryAt = Collections.unmodifiableList(builder.retryAt);
     }
 
     public static Builder builder() {
         return new Builder();
     }
 
-    public static class Builder {
+    public static final class Builder {
         private int delaySeconds = Defaults.DEFAULT_RETRY_DELAY_SECONDS;
         private int initialDelaySeconds = Defaults.DEFAULT_RETRY_INITIAL_DELAY_SECONDS;
-        private List<Duration> retryAt = Defaults.DEFAULT_RETRY_AT;
+        private List<Duration> retryAt = new ArrayList<>(Defaults.DEFAULT_RETRY_AT);
 
-        public Builder delaySeconds(int delaySeconds) {
+        public Builder delaySeconds(final int delaySeconds) {
             this.delaySeconds = delaySeconds;
             return this;
         }
 
-        public Builder initialDelaySeconds(int initialDelaySeconds) {
+        public Builder initialDelaySeconds(final int initialDelaySeconds) {
             this.initialDelaySeconds = initialDelaySeconds;
             return this;
         }
 
-        public Builder retryAt(List<Duration> retryAt) {
+        public Builder retryAt(final List<Duration> retryAt) {
             this.retryAt = new ArrayList<>(retryAt);
             Collections.sort(this.retryAt);
             return this;

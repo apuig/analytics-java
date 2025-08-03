@@ -9,12 +9,16 @@ public class Defaults {
     public static final String DEFAULT_ENDPOINT = "https://api.segment.io";
     public static final String DEFAULT_PATH = "/v1/b";
 
-    // HTTP
-    public static final int DEFAULT_HTTP_QUEUE_SIZE = 1_000; // analytics-java MAX_VALUE; SegmentQueue 250
-    public static final int DEFAULT_HTTP_QUEUE_FLUSH_SIZE = 500; // analytics-java 250; SegmentQueue 50
-    public static final int DEFAULT_HTTP_QUEUE_FLUSH_MS = 1000 * 10;
+    public static final int DEFAULT_QUEUE_SIZE = 1_000; // analytics-java MAX_VALUE; SegmentQueue 250
+    public static final int DEFAULT_QUEUE_FLUSH_SIZE = 20; // analytics-java 250; SegmentQueue 50
+    public static final int DEFAULT_QUEUE_FLUSH_MS = 30_000;
 
-    public static final int DEFAULT_HTTP_EXECUTOR_SIZE = 1;
+    // HTTP
+    public static final int DEFAULT_HTTP_QUEUE_SIZE = DEFAULT_QUEUE_SIZE;
+    public static final int DEFAULT_HTTP_QUEUE_FLUSH_SIZE = DEFAULT_QUEUE_FLUSH_SIZE;
+    public static final int DEFAULT_HTTP_QUEUE_FLUSH_MS = DEFAULT_QUEUE_FLUSH_MS;
+
+    public static final int DEFAULT_HTTP_EXECUTOR_SIZE = 2;
     public static final int DEFAULT_HTTP_EXECUTOR_QUEUE_SIZE = 0; // SegmentQueue  5;
 
     public static final int DEFAULT_HTTP_CONNECTION_TIMEOUT_SECONDS = 15;
@@ -26,13 +30,13 @@ public class Defaults {
     public static final int DEFAULT_HTTP_CIRCUIT_REQUESTS_TO_CLOSE = 1;
 
     // STORAGE
-    public static final int DEFAULT_STORAGE_QUEUE_SIZE = 1_000;
-    public static final int DEFAULT_STORAGE_QUEUE_FLUSH_SIZE = 500;
-    public static final int DEFAULT_STORAGE_QUEUE_FLUSH_MS = 1_000 * 10;
+    public static final int DEFAULT_STORAGE_QUEUE_SIZE = DEFAULT_QUEUE_SIZE;
+    public static final int DEFAULT_STORAGE_QUEUE_FLUSH_SIZE = DEFAULT_QUEUE_FLUSH_SIZE;
+    public static final int DEFAULT_STORAGE_QUEUE_FLUSH_MS = DEFAULT_QUEUE_FLUSH_MS;
     public static final String DEFAULT_STORAGE_FILE = "pending";
 
     // RETRY
-    public static final int DEFAULT_RETRY_DELAY_SECONDS = 60;
+    public static final int DEFAULT_RETRY_DELAY_SECONDS = 10; 
     public static final int DEFAULT_RETRY_INITIAL_DELAY_SECONDS = 10;
     public static final List<Duration> DEFAULT_RETRY_AT = List.of(
             Duration.ofSeconds(1),

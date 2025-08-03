@@ -1,6 +1,7 @@
 package com.segment.analytics.dto;
 
 import java.util.Map;
+import java.util.UUID;
 
 /**
  * The identify call ties a customer and their actions to a recognizable ID and traits like their email, name, etc.
@@ -13,6 +14,13 @@ public class IdentifyMessage extends Message {
     public IdentifyMessage() {
         super();
         setType(Type.identify);
+    }
+
+    public IdentifyMessage(String userId, Map<String, ?> traits) {
+        this();
+        setUserId(userId);
+        setTraits(traits);
+        setMessageId(UUID.randomUUID().toString());
     }
 
     public Map<String, ?> getTraits() {

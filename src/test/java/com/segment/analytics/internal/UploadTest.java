@@ -8,6 +8,22 @@ import static com.github.tomakehurst.wiremock.client.WireMock.urlEqualTo;
 import static com.github.tomakehurst.wiremock.core.WireMockConfiguration.wireMockConfig;
 import static org.assertj.core.api.Assertions.assertThat;
 
+import dev.failsafe.CircuitBreaker;
+import java.lang.reflect.Field;
+import java.net.URI;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
+
+import org.awaitility.Awaitility;
+import org.junit.Before;
+import org.junit.Rule;
+import org.junit.Test;
+
 import com.github.tomakehurst.wiremock.junit.WireMockRule;
 import com.github.tomakehurst.wiremock.stubbing.ServeEvent;
 import com.segment.analytics.config.Defaults;
@@ -15,15 +31,6 @@ import com.segment.analytics.config.HttpConfig;
 import com.segment.analytics.dto.Batch;
 import com.segment.analytics.dto.IdentifyMessage;
 import com.segment.analytics.dto.TrackMessage;
-import java.net.URI;
-import java.time.Duration;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.function.Consumer;
-import org.awaitility.Awaitility;
-import org.junit.Before;
-import org.junit.Rule;
-import org.junit.Test;
 
 public class UploadTest {
 
@@ -87,6 +94,141 @@ public class UploadTest {
     }
 
     @Test
+    public void uploadBadRequestNoRetry() {
+        // Given a batch
+        Batch b = batch();
+
+        // and segment not accessible
+        stubFor(post(urlEqualTo("/v1/b")).willReturn(aResponse().withStatus(400).withBody("bad request")));
+
+        // When upload
+        up.upload(b);
+
+        // Then the batch is discarted (no retry, no fallback)
+        Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> !wireMock.getAllServeEvents().isEmpty());
+        assertThat(fallbackBatches).isEmpty();
+    }
+
+    @Test
+    public void uploadRateLimitOpensCircuit() throws Exception {
+        // Given a batch
+        Batch b = batch();
+
+        // and segment not accessible
+        stubFor(post(urlEqualTo("/v1/b")).willReturn(aResponse().withStatus(429).withBody("rate limit")));
+
+        // When upload
+        up.upload(b);
+
+        // Then the batch is received at the fallback
+        Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> !fallbackBatches.isEmpty());
+        assertThat(fallbackBatches).singleElement().isEqualTo(b);
+
+        // Circuit should be open after rate limit
+        up.upload(batch());
+        Awaitility.await().atMost(Duration.ofSeconds(2)).until(() -> fallbackBatches.size() == 2);
+
+        // Check circuit breaker state is OPEN
+        CircuitBreaker<?> breaker = getBreaker(up);
+        assertThat(breaker.isOpen()).isTrue();
+
+        // Wait for circuit to half-open
+        Thread.sleep(5000);
+        assertThat(breaker.isHalfOpen() || breaker.isOpen()).isTrue();
+    }
+
+    private CircuitBreaker<?> getBreaker(Upload up) throws Exception {
+        Field breakerField = Upload.class.getDeclaredField("breaker");
+        breakerField.setAccessible(true);
+        return (CircuitBreaker<?>) breakerField.get(up);
+    }
+
+    @Test
+    public void uploadServerErrorRetries() {
+        // Given a batch
+        Batch b = batch();
+
+        // and segment not accessible
+        stubFor(post(urlEqualTo("/v1/b")).willReturn(aResponse().withStatus(500).withBody("server error")));
+
+        // When upload
+        up.upload(b);
+
+        // Then the batch is received at the fallback
+        Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> fallbackBatches.size() == 1);
+        assertThat(fallbackBatches).singleElement().isEqualTo(b);
+    }
+
+    @Test
+    public void uploadNetworkException()  {
+        // Simulate network exception by shutting down WireMock
+        wireMock.stop();
+        Batch b = batch();
+        up.upload(b);
+
+        Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> fallbackBatches.size() == 1);
+        wireMock.start();
+    }
+
+    @Test
+    public void uploadExecutorExhaustion() throws Exception {
+        // Create Upload with small executor queue
+        up = new Upload(
+                HttpConfig.builder()
+                        .executorSize(1)
+                        .executorQueueSize(0)
+                        .build(),
+                new URI(wireMock.baseUrl() + Defaults.DEFAULT_PATH),
+                fallback);
+
+        stubFor(post(urlEqualTo("/v1/b")).willReturn(okJson("{\"success\": \"true\"}")));
+
+        int batchCount = 10;
+        CountDownLatch latch = new CountDownLatch(batchCount);
+        for (int i = 0; i < batchCount; i++) {
+            up.upload(batch());
+            latch.countDown();
+        }
+        Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> wireMock.getAllServeEvents().size() == batchCount);
+        assertThat(fallbackBatches).isEmpty();
+    }
+
+    @Test
+    public void uploadGzipHeader() throws Exception {
+        up = new Upload(
+                HttpConfig.builder()
+                        .gzip(true)
+                        .build(),
+                new URI(wireMock.baseUrl() + Defaults.DEFAULT_PATH),
+                fallback);
+
+        stubFor(post(urlEqualTo("/v1/b")).willReturn(okJson("{\"success\": \"true\"}")));
+        up.upload(batch());
+
+        Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> !wireMock.getAllServeEvents().isEmpty());
+        ServeEvent event = wireMock.getAllServeEvents().get(0);
+        assertThat(event.getRequest().getHeader("Content-Encoding")).isEqualTo("gzip");
+    }
+
+    @Test
+    public void uploadConcurrent() throws Exception {
+        stubFor(post(urlEqualTo("/v1/b")).willReturn(okJson("{\"success\": \"true\"}")));
+        int batches = 20;
+        CountDownLatch latch = new CountDownLatch(batches);
+        AtomicInteger success = new AtomicInteger();
+        for (int i = 0; i < batches; i++) {
+            new Thread(() -> {
+                up.upload(batch());
+                success.incrementAndGet();
+                latch.countDown();
+            }).start();
+        }
+        latch.await(5, TimeUnit.SECONDS);
+        Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> wireMock.getAllServeEvents().size() == batches);
+        assertThat(fallbackBatches).isEmpty();
+    }
+
+    @Test
     public void uploadCircuit() throws Throwable {
         // Given circuit configuration
 
@@ -118,7 +260,7 @@ public class UploadTest {
 
         // Then the batch is received
         Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> receivedCount() == 3);
-        assertThat(fallbackBatches.size()).isEqualTo(3);
+        assertThat(fallbackBatches).hasSize(3);
     }
 
     private int receivedCount() {

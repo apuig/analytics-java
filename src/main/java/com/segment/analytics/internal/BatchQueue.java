@@ -15,12 +15,14 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 import java.util.stream.Collectors;
 
 public class BatchQueue implements Runnable, Closeable {
+    private static final Logger LOGGER = Logger.getLogger(BatchQueue.class.getName());
     private final BlockingQueue<MessageWithSize> queue;
     private final Thread pollQueue;
-
     private final String writeKey;
     private final Map<String, ?> context;
     private final BatchQueueConfig config;
@@ -32,6 +34,16 @@ public class BatchQueue implements Runnable, Closeable {
             Map<String, ?> context,
             BatchQueueConfig config,
             Consumer<Batch> batchConsumer) {
+        this(threadFactory, writeKey, context, config, batchConsumer, true);
+    }
+
+    protected BatchQueue(
+            ThreadFactory threadFactory,
+            String writeKey,
+            Map<String, ?> context,
+            BatchQueueConfig config,
+            Consumer<Batch> batchConsumer,
+            boolean startThread) {
         this.writeKey = writeKey;
         this.context = context;
         this.config = config;
@@ -39,16 +51,20 @@ public class BatchQueue implements Runnable, Closeable {
         this.queue = new LinkedBlockingQueue<>(config.size);
         this.pollQueue = threadFactory.newThread(this);
         this.pollQueue.setName("segment-" + batchConsumer.getClass().getSimpleName());
-        this.pollQueue.start();
+        if (startThread) {
+            this.pollQueue.start();
+        }
     }
 
     @Override
     public void close() {
-        pollQueue.interrupt();
-        try {
-            pollQueue.join();
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
+        if (pollQueue.isAlive()) {
+            pollQueue.interrupt();
+            try {
+                pollQueue.join();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
         }
     }
 
@@ -83,9 +99,6 @@ public class BatchQueue implements Runnable, Closeable {
         List<MessageWithSize> waitingBatch = new ArrayList<>();
         queue.drainTo(waitingBatch);
         return waitingBatch;
-    }
-
-    public static void main(String[] args) {
     }
 
     @Override
@@ -129,7 +142,7 @@ public class BatchQueue implements Runnable, Closeable {
                     batch.setWriteKey(writeKey);
                     batch.setBatch(messages.stream().map(mws -> mws.message).collect(Collectors.toList()));
 
-                    batchConsumer.accept(batch);
+                    consume(batch);
 
                     batchSize = batchBaseSize;
                     messages.clear();
@@ -137,7 +150,6 @@ public class BatchQueue implements Runnable, Closeable {
                         messages.add(message);
                         batchSize += message.size;
                         firstMessageTime = message.message.getTimestamp().toEpochMilli();
-                        sizeOverflow = false;
                     }
                 }
             } catch (InterruptedException e) {
@@ -145,5 +157,14 @@ public class BatchQueue implements Runnable, Closeable {
             }
         }
         queue.addAll(messages);
+    }
+
+    private void consume(Batch batch) {
+        try {
+            batchConsumer.accept(batch);
+        } catch (Exception e) {
+            LOGGER.log(Level.WARNING, e, () -> "Unexpected error processing batch. %d events will be lost"
+                    .formatted(batch.getBatch().size()));
+        }
     }
 }
